@@ -54,3 +54,23 @@ def get_user_details(user_id):
         } if wallet else None,
         "created_at": user.created_at.isoformat()
     }), 200
+
+#3.Admin Create User endpoint
+@admin_bp.route('/users', methods=['POST'])
+@admin_required()
+def create_user():
+    data =request.get_json()
+    if User.query.filter_by(email=data.get('email')).first():
+        return jsonify({"error": "Email already exists"}), 400
+    new_user =User(
+        name=data.get('name'),
+        email=data.get('email'),
+        role=data.get('role', 'customer'),
+    )
+    new_user.set_password(data.get('password'))
+    #Create associated wallet
+    new_wallet =Wallet(user=new_user, balance=Decimal(str(data.get('initial_balance', 0.00))))
+
+db.session.add(new_user)
+db.session.add(new_wallet)
+db.session.commit()
