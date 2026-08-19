@@ -70,7 +70,23 @@ def create_user():
     new_user.set_password(data.get('password'))
     #Create associated wallet
     new_wallet =Wallet(user=new_user, balance=Decimal(str(data.get('initial_balance', 0.00))))
+    db.session.add(new_user)
+    db.session.add(new_wallet)
+    db.session.commit()
 
-db.session.add(new_user)
-db.session.add(new_wallet)
-db.session.commit()
+    return jsonify({"message":"User and wallet created successfully", "user_id": new_user.id}), 201
+# 4.Admin Update User endpoint
+@admin_bp.route('/users/<int:user_id>', methods=['PUT'])
+@admin_required()
+def update_user(user_id):
+    user = User.query.get_or_404(user_id)
+    data = request.get_json() or{}
+
+    if 'name' in data:
+        user.name =data['name']
+    if 'role' in data:
+        user.role =data['role']
+    if 'is_active' in data:
+        user.is_active = data['is_active']
+    db.session .commit()
+    return jsonify({"message": "User updated successfully"}), 200
