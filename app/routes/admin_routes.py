@@ -90,3 +90,11 @@ def update_user(user_id):
         user.is_active = data['is_active']
     db.session .commit()
     return jsonify({"message": "User updated successfully"}), 200
+#5.Admin delete /Deactivate User endpoint
+@admin_bp.route('/users/<int:user_id>', methods=['DELETE'])
+@admin_required()
+def deactivate_user(user_id):
+    user =User.query.get_or_404(user_id)
+    user.is_active =False
+    db.session.commit()
+    return jsonify({"message": f"User {user.id} has been deactivated successfully"}), 200
