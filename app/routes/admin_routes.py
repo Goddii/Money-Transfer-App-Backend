@@ -145,3 +145,24 @@ def get_global_analytics():
         "total_transaction_volume": str(total_volume),
         "total_platform_profit": str(total_fees_collected)
     }), 200
+
+# 9. Admin Profit / Fee Trends Endpoint
+@admin_bp.route('/analytics/profit-trends', methods=['GET'])
+@admin_required()
+def get_profit_trends():
+    # Groups profits and volume by date
+    results = db.session.query(
+        func.date(Transaction.timestamp).label('date'),
+        func.sum(Transaction.fee_charged).label('daily_profit'),
+        func.sum(Transaction.amount).label('daily_volume'),
+        func.count(Transaction.id).label('transaction_count')
+    ).group_by(func.date(Transaction.timestamp)).order_by(func.date(Transaction.timestamp).desc()).all()
+
+    trends = [{
+        "date": str(row.date),
+        "daily_profit": str(row.daily_profit or 0.00),
+        "daily_volume": str(row.daily_volume or 0.00),
+        "transaction_count": row.transaction_count
+    } for row in results]
+
+    return jsonify({"profit_trends": trends}), 200
