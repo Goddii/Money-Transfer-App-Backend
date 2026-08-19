@@ -33,3 +33,24 @@ def get_all_users():
         "pages": pagination.pages,
         "current_page": pagination.page
     }), 200
+
+#2. Admin User Details endpoint
+@admin_bp.route('/users/<int:user_id>', methods=['GET'])
+@admin_required()
+def get_user_details(user_id):
+    user = User.query.get_or_404(user_id)
+    wallet = user.wallet
+
+    return jsonify({
+        "id": user.id,
+        "name": user.name,
+        "email": user.email,
+        "role": user.role,
+        "is_active": user.is_active,
+        "wallet": {
+            "id": wallet.id,
+            "balance": str(wallet.balance),
+            "currency": wallet.currency
+        } if wallet else None,
+        "created_at": user.created_at.isoformat()
+    }), 200
