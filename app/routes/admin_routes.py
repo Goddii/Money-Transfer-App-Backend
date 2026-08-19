@@ -129,3 +129,19 @@ def get_all_transactions():
         "timestamp": t.timestamp.isoformat()
     } for t in txs]
     return jsonify({"transactions": result}), 200
+
+# 8. Admin Global Analytics Endpoint
+@admin_bp.route('/analytics', methods=['GET'])
+@admin_required()
+def get_global_analytics():
+    total_users = User.query.count()
+    total_liquidity = db.session.query(func.sum(Wallet.balance)).scalar() or Decimal('0.00')
+    total_volume = db.session.query(func.sum(Transaction.amount)).scalar() or Decimal('0.00')
+    total_fees_collected = db.session.query(func.sum(Transaction.fee_charged)).scalar() or Decimal('0.00')
+
+    return jsonify({
+        "total_users": total_users,
+        "total_liquidity": str(total_liquidity),
+        "total_transaction_volume": str(total_volume),
+        "total_platform_profit": str(total_fees_collected)
+    }), 200
