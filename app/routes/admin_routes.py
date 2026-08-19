@@ -113,3 +113,19 @@ def get_all_wallets():
     } for w in wallets]
     return jsonify({"wallets": result}), 200
 
+# 7. Admin Master Transactions Endpoint
+@admin_bp.route('/transactions', methods=['GET'])
+@admin_required()
+def get_all_transactions():
+    txs = Transaction.query.order_by(Transaction.timestamp.desc()).all()
+    result = [{
+        "id": t.id,
+        "sender_wallet_id": t.sender_wallet_id,
+        "receiver_wallet_id": t.receiver_wallet_id,
+        "amount": str(t.amount),
+        "fee_charged": str(t.fee_charged),
+        "type": t.transaction_type,
+        "status": t.status,
+        "timestamp": t.timestamp.isoformat()
+    } for t in txs]
+    return jsonify({"transactions": result}), 200
