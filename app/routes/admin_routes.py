@@ -98,3 +98,18 @@ def deactivate_user(user_id):
     user.is_active =False
     db.session.commit()
     return jsonify({"message": f"User {user.id} has been deactivated successfully"}), 200
+
+# 6. Admin Wallet Information Endpoint
+@admin_bp.route('/wallets', methods=['GET'])
+@admin_required()
+def get_all_wallets():
+    wallets = Wallet.query.all()
+    result = [{
+        "wallet_id": w.id,
+        "user_id": w.user_id,
+        "user_name": w.user.name,
+        "balance": str(w.balance),
+        "currency": w.currency
+    } for w in wallets]
+    return jsonify({"wallets": result}), 200
+
