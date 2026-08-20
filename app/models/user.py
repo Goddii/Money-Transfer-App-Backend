@@ -35,3 +35,17 @@ class Wallet(db.Model):
     balance = db.Column(db.Numeric(12, 2), default=0.00)
     currency = db.Column(db.String(3), default='USD')
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+
+class Transaction(db.Model):
+    __tablename__ = 'transactions'
+
+    id = db.Column(db.Integer, primary_key=True)
+    tx_code = db.Column(db.String(20), unique=True, nullable=False) # e.g., 'TX-89241'
+    sender_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
+    receiver_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    amount = db.Column(db.Numeric(12, 2), nullable=False)
+    fee = db.Column(db.Numeric(12, 2), default=0.00)
+    status = db.Column(db.String(20), default='Completed') # 'Completed', 'Pending', 'Failed'
+    tx_type = db.Column(db.String(50), nullable=False) # 'P2P Transfer', 'Deposit Surcharge', 'Merchant Settlement'
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
