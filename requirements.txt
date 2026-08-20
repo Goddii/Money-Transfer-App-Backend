@@ -10,6 +10,8 @@ Flask-Cors==6.0.2
 
 psycopg2-binary==2.9.10
 
+gunicorn==23.0.0
+
 python-dotenv==1.1.0
 
 Werkzeug==3.1.3
