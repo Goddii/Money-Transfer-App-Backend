@@ -30,3 +30,14 @@ class AuthService:
         db.session.add(user)
         db.session.commit()
         return user
+
+    @staticmethod
+    def login_user(email, password):
+        email = email.strip().lower()
+        user = User.query.filter_by(email=email).first()
+        if not user or not user.check_password(password):
+            raise ValueError("Invalid email or password")
+        if not user.is_active:
+            raise ValueError("User account is inactive")
+        access_token = create_access_token(identity=str(user.id), additional_claims={"role": user.role})
+        return user, access_token
