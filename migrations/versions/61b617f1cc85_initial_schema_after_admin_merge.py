@@ -1,8 +1,8 @@
 """initial schema after admin merge
 
-Revision ID: 070e1b4ce715
+Revision ID: 61b617f1cc85
 Revises: 
-Create Date: 2026-08-20 22:04:52.592859
+Create Date: 2026-08-20 22:09:35.339066
 
 """
 from alembic import op
@@ -10,7 +10,7 @@ import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
-revision = '070e1b4ce715'
+revision = '61b617f1cc85'
 down_revision = None
 branch_labels = None
 depends_on = None
