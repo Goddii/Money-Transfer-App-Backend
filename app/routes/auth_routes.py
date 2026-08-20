@@ -91,4 +91,3 @@ def login():
                 "message": "An unexpected error occurred.",
             }
         ), 500
-    

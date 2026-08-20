@@ -15,14 +15,14 @@ def create_app():
 
 
     #import models to register them with SQLAlchemy
-    from app.models.user import User
-    from app.models.beneficiary import Beneficiary
+    from app.models import User, Wallet, Transaction, Beneficiary
 
     
     # Register blueprints
-    from app.routes import auth_bp, user_bp
+    from app.routes import auth_bp, user_bp, admin_bp
     app.register_blueprint(auth_bp, url_prefix='/api/auth')
     app.register_blueprint(user_bp, url_prefix='/api/users')
+    app.register_blueprint(admin_bp)
     
     @app.get('/')
     def health_check():

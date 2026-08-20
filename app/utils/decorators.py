@@ -57,3 +57,7 @@ def role_required(required_role):
         return wrapper
 
     return decorator
+
+
+def admin_required():
+    return role_required('admin')
