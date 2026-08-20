@@ -23,3 +23,37 @@ def jwt_required_custom(fn):
         return fn(*args, **kwargs)
 
     return wrapper
+
+def role_required(required_role):
+
+    def decorator(fn):
+
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+
+            try:
+                verify_jwt_in_request()
+
+                claims = get_jwt()
+
+                if claims.get("role") != required_role:
+                    return jsonify(
+                        {
+                            "success": False,
+                            "message": "Access forbidden.",
+                        }
+                    ), 403
+
+            except Exception:
+                return jsonify(
+                    {
+                        "success": False,
+                        "message": "Authentication required.",
+                    }
+                ), 401
+
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
