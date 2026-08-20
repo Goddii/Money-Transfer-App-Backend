@@ -14,5 +14,5 @@ class Beneficiary(db.Model):
     beneficiary = db.relationship('User', foreign_keys=[beneficiary_user_id], back_populates='benefited')
 
     __table_args__ = (
-        db.UniqueConstraint('user_id', 'beneficiary_user_id', name='unique_user_beneficiary')
+        db.UniqueConstraint('user_id', 'beneficiary_user_id', name='unique_user_beneficiary'),
     )
