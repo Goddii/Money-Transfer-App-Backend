@@ -51,3 +51,44 @@ def register():
                 "message" :  "An unexpected error occurred"
             }
         ), 500
+
+@auth_bp.post("/login")
+def login():
+    try:
+        data = request.get_json(silent=True) or {}
+
+        validated_data = validate_login(data)
+
+        user, access_token = AuthService.login_user(
+            email=validated_data["email"],
+            password=validated_data["password"],
+        )
+
+        return jsonify(
+            {
+                "success": True,
+                "message": "Login successful.",
+                "data": {
+                    "access_token": access_token,
+                    "token_type": "Bearer",
+                    "user": user.to_dict(),
+                },
+            }
+        ), 200
+
+    except ValueError as error:
+        return jsonify(
+            {
+                "success": False,
+                "message": str(error),
+            }
+        ), 401
+
+    except Exception:
+        return jsonify(
+            {
+                "success": False,
+                "message": "An unexpected error occurred.",
+            }
+        ), 500
+    
