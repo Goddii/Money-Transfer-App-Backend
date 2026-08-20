@@ -47,5 +47,5 @@ class Transaction(db.Model):
     amount = db.Column(db.Numeric(12, 2), nullable=False)
     fee = db.Column(db.Numeric(12, 2), default=0.00)
     status = db.Column(db.String(20), default='Completed') # 'Completed', 'Pending', 'Failed'
-    tx_type = db.Column(db.String(50), nullable=False) # 'P2P Transfer', 'Deposit Surcharge', 'Merchant Settlement'
+    tx_type = db.Column(db.String(50), nullable=False) 
     timestamp = db.Column(db.DateTime, default=datetime.utcnow)
