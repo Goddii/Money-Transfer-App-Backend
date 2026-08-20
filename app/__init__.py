@@ -21,8 +21,13 @@ def create_app():
     
     # Register blueprints
     from app.routes import auth_bp, user_bp
-    app.register_blueprint(auth_bp)
-    app.register_blueprint(user_bp)
+    app.register_blueprint(auth_bp, url_prefix='/api/auth')
+    app.register_blueprint(user_bp, url_prefix='/api/users')
     
-
+    @app.get('/')
+    def health_check():
+        return {
+            "status": "success",
+            "message": "Vyloc Api is running!"
+        }, 200
     return app
