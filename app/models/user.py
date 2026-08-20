@@ -17,6 +17,9 @@ class User(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+    beneficiaries = db.relationship('Beneficiary', foreign_keys='Beneficiary.user_id', back_populates='user', cascade='all, delete-orphan')
+    benefited = db.relationship('Beneficiary', foreign_keys='Beneficiary.beneficiary_user_id', back_populates='beneficiary', cascade='all, delete-orphan')
+
     def set_password(self, password):
         self.password_hash = generate_password_hash(password)
 
