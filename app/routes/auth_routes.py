@@ -1,30 +1,42 @@
-from flask import Blueprint,request,jsonify
+from flask import Blueprint, request, jsonify
 from flask_jwt_extended import create_access_token
-from models import User
+from models import db, User
 
-auth_bp = Blueprint('auth', __name__)
+auth_bp = Blueprint('auth', __name__, url_prefix='/api/v1/auth')
 
-@auth_bp.route('auth/login', methods=['POST'])
+# Login Route for both Admin and Customers
+@auth_bp.route('/login', methods=['POST'])
 def login():
-    data = request.get_json()
-    email =data.get('email')
-    password = data.get('password')
+    request_data = request.get_json()
 
+    if not request_data or not request_data.get('email') or not request_data.get('password'):
+        return jsonify({"message": "Email and password are required"}), 400
+
+    email = request_data.get('email')
+    password = request_data.get('password')
+
+    # Find user by email
     user = User.query.filter_by(email=email).first()
 
+    # Check password
     if not user or not user.check_password(password):
-        return jsonify({"error": "Invalid email or password"}), 401
-    if not user.is_active:
-        return jsonify({"error": "Account is deactivated"}), 403
-    
-    # Generate JWT token
-    access_token = create_access_token(identity=user.id, additional_claims={"role": user.role})
+        return jsonify({"message": "Invalid email or password"}), 401
+
+    # Check if user status is active
+    if user.status == 'Frozen':
+        return jsonify({"message": "Your account has been frozen. Contact admin"}), 403
+
+    # Generate access token containing user id identity
+    access_token = create_access_token(identity=user.id)
+
     return jsonify({
+        "message": "Login successful",
         "access_token": access_token,
         "user": {
             "id": user.id,
             "name": user.name,
             "email": user.email,
-            "role": user.role
+            "role": user.role,
+            "status": user.status
         }
     }), 200
