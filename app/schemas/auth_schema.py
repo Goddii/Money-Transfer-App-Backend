@@ -45,3 +45,14 @@ def validate_registration(data):
             or None
         ),
     }
+def validate_login(data):
+    if not data.get("email"):
+        raise ValueError("Email is required.")
+
+    if not data.get("password"):
+        raise ValueError("Password is required.")
+
+    return {
+        "email": data["email"].strip().lower(),
+        "password": data["password"],
+    }
