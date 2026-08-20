@@ -1,0 +1,34 @@
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment variables & secrets
+.env
+.env.local
+.env.*.local
+*.env
+
+# Python bytecode & cache
+__pycache__/
+pycache__/
+*.py[cod]
+*$py.class
+
+# Database / SQLite (if using local dev databases)
+instance/
+*.db
+*.sqlite3
+
+# IDE / Editor configuration files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS metadata
+.DS_Store
+Thumbs.db

@@ -1,0 +1,53 @@
+from datetime import datetime
+from werkzeug.security import generate_password_hash, check_password_hash
+from app.extensions import db
+
+
+class User(db.Model):
+    __tablename__ = 'users'
+
+    id = db.Column(db.Integer, primary_key=True)
+    first_name = db.Column(db.String(100), nullable=False)
+    last_name = db.Column(db.String(100), nullable=False)
+    email = db.Column(db.String(255), unique=True, nullable=False)
+    phone_number = db.Column(db.String(20), unique=True, nullable=True)
+    password_hash = db.Column(db.String(255), nullable=False)
+    role = db.Column(db.String(50), nullable=False, default='user')
+    is_active = db.Column(db.Boolean, default=True)
+    avatar_url = db.Column(db.String(255), nullable=True)
+    status = db.Column(db.String(20), default='Active')
+    verification_tier = db.Column(db.String(50), default='VERIFIED CUSTOMER')
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    beneficiaries = db.relationship('Beneficiary', foreign_keys='Beneficiary.user_id', back_populates='user', cascade='all, delete-orphan')
+    benefited = db.relationship('Beneficiary', foreign_keys='Beneficiary.beneficiary_user_id', back_populates='beneficiary', cascade='all, delete-orphan')
+    wallet = db.relationship('Wallet', backref='user', uselist=False, cascade='all, delete-orphan')
+
+    def set_password(self, password):
+        self.password_hash = generate_password_hash(password)
+
+    def check_password(self, password):
+        return check_password_hash(self.password_hash, password)
+
+    @property
+    def name(self):
+        return f"{self.first_name} {self.last_name}"
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'first_name': self.first_name,
+            'last_name': self.last_name,
+            'name': self.name,
+            'email': self.email,
+            'phone_number': self.phone_number,
+            'role': self.role,
+            'is_active': self.is_active,
+            'status': self.status,
+            'verification_tier': self.verification_tier,
+            'avatar_url': self.avatar_url,
+            'created_at': self.created_at.isoformat(),
+            'updated_at': self.updated_at.isoformat()
+            if self.updated_at else None,
+        }
