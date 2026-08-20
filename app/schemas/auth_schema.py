@@ -1,6 +1,9 @@
 import re
 
 def validate_registration(data):
+    if not isinstance(data, dict):
+        raise ValueError("Request body must be a JSON object.")
+
     required_fields = [
         "first_name",
         "last_name",
@@ -46,6 +49,9 @@ def validate_registration(data):
         ),
     }
 def validate_login(data):
+    if not isinstance(data, dict):
+        raise ValueError("Request body must be a JSON object.")
+
     if not data.get("email"):
         raise ValueError("Email is required.")
 
