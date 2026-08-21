@@ -60,4 +60,20 @@ def role_required(required_role):
 
 
 def admin_required():
-    return role_required('admin')
+    def decorator(func):
+        @wraps(func)
+        def wrapped(*args, **kwargs):
+            try:
+                verify_jwt_in_request()
+            except Exception:
+                return jsonify({"message": "Authentication required."}), 401
+
+            current_user_id = get_jwt_identity()
+            user = User.query.get(current_user_id)
+
+            if not user or user.role != 'admin' or user.status != 'Active':
+                return jsonify({"message": "Admin privileges required"}), 403
+
+            return func(*args, **kwargs)
+        return wrapped
+    return decorator
