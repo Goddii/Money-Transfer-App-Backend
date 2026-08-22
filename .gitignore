@@ -32,3 +32,6 @@ instance/
 # OS metadata
 .DS_Store
 Thumbs.db
+
+agents.md
+backend-for-review.md
