@@ -84,10 +84,12 @@ def login():
             }
         ), 401
 
-    except Exception:
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
         return jsonify(
             {
                 "success": False,
-                "message": "An unexpected error occurred.",
+                "message": f"An unexpected error occurred: {str(e)}",
             }
         ), 500
