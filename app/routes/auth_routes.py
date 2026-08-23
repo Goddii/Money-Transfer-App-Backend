@@ -5,6 +5,12 @@ from app.schemas.auth_schema import (
     validate_registration,
 )
 from app.services.auth_service import AuthService
+from app.utils.errors import (
+    ApiError,
+    ErrorCode,
+    api_error_response,
+    log_exception,
+)
 
 
 auth_bp = Blueprint(
@@ -36,19 +42,27 @@ def register():
                 },
             }
         ), 201
+    except ApiError as error:
+        # Conflicts (duplicate email/phone) surface as 409; other service
+        # errors keep their own status/code.
+        return api_error_response(error)
+
     except ValueError as error: 
         return jsonify(
             {
                 "success" : False,
-                "message" : str(error)
+                "message" : str(error),
+                "error" : ErrorCode.VALIDATION_ERROR,
             }
         ), 400
 
     except Exception:
+        log_exception("register")
         return jsonify(
             {
                 "success" : False,
-                "message" :  "An unexpected error occurred"
+                "message" :  "An unexpected error occurred",
+                "error" : ErrorCode.INTERNAL_ERROR,
             }
         ), 500
 
@@ -81,15 +95,18 @@ def login():
             {
                 "success": False,
                 "message": str(error),
+                "error": ErrorCode.INVALID_CREDENTIALS,
             }
         ), 401
 
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
+    except Exception:
+        # Internal exception details are logged server-side only; the client
+        # receives the project's generic error response.
+        log_exception("login")
         return jsonify(
             {
                 "success": False,
-                "message": f"An unexpected error occurred: {str(e)}",
+                "message": "An unexpected error occurred",
+                "error": ErrorCode.INTERNAL_ERROR,
             }
         ), 500
