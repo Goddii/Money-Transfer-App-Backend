@@ -1,11 +1,12 @@
 from flask import Flask
 from app.config import Config
 from app.extensions import db, migrate, jwt, cors
+from app.utils.errors import register_error_handlers
 
 
-def create_app():
+def create_app(config_object=Config):
     app = Flask(__name__)
-    app.config.from_object(Config)
+    app.config.from_object(config_object)
 
     # Initialize extensions
     db.init_app(app)
@@ -15,15 +16,36 @@ def create_app():
 
 
     #import models to register them with SQLAlchemy
-    from app.models import User, Wallet, Transaction, Beneficiary
+    from app.models import (
+        Beneficiary,
+        MpesaTransaction,
+        Transaction,
+        User,
+        Wallet,
+        WalletLedger,
+    )
 
     
     # Register blueprints
-    from app.routes import auth_bp, user_bp, admin_bp
+    from app.routes import (
+        admin_bp,
+        auth_bp,
+        beneficiary_bp,
+        mpesa_bp,
+        transaction_bp,
+        user_bp,
+        wallet_bp,
+    )
     app.register_blueprint(auth_bp, url_prefix='/api/auth')
     app.register_blueprint(user_bp, url_prefix='/api/users')
+    app.register_blueprint(wallet_bp, url_prefix='/api/wallet')
+    app.register_blueprint(beneficiary_bp, url_prefix='/api/beneficiaries')
+    app.register_blueprint(transaction_bp, url_prefix='/api/transactions')
+    app.register_blueprint(mpesa_bp, url_prefix='/api/mpesa')
     app.register_blueprint(admin_bp)
-    
+
+    register_error_handlers(app)
+
     @app.get('/')
     def health_check():
         return {
