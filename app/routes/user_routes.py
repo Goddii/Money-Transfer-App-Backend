@@ -3,7 +3,8 @@ from flask_jwt_extended import get_jwt_identity
 
 from app.schemas.user_schema import validate_user_update
 from app.services.user_service import UserService
-from app.utils.decorators import jwt_required_custom
+from app.utils.decorators import handle_api_errors, jwt_required_custom
+from app.utils.errors import ErrorCode
 
 
 user_bp = Blueprint(
@@ -13,6 +14,7 @@ user_bp = Blueprint(
 
 @user_bp.get("/me")
 @jwt_required_custom
+@handle_api_errors
 def get_current_user():
     user_id = get_jwt_identity()
 
@@ -23,6 +25,7 @@ def get_current_user():
             {
                 "success" : False,
                 "message" : "User not found",
+                "error" : ErrorCode.USER_NOT_FOUND,
             }
         ), 404
 
@@ -37,6 +40,7 @@ def get_current_user():
 
 @user_bp.put("/me")
 @jwt_required_custom
+@handle_api_errors
 def update_current_user():
 
     user_id = get_jwt_identity()
@@ -48,6 +52,7 @@ def update_current_user():
             {
                 "success": False,
                 "message": "User not found.",
+                "error": ErrorCode.USER_NOT_FOUND,
             }
         ), 404
 
@@ -76,5 +81,6 @@ def update_current_user():
             {
                 "success": False,
                 "message": str(error),
+                "error": ErrorCode.VALIDATION_ERROR,
             }
         ), 400
