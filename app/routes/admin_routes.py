@@ -21,8 +21,8 @@ def get_dashboard_overview():
     return jsonify({
         "total_users": str(total_users),
         "active_wallets": str(active_wallets),
-        "platform_liquidity": "$" + str(round(total_liquidity, 2)),
-        "collected_fees": "$" + str(round(collected_fees, 2))
+        "platform_liquidity": "KES " + str(round(total_liquidity, 2)),
+        "collected_fees": "KES " + str(round(collected_fees, 2))
     }), 200
 
 # 2. Get Users and Create User
@@ -105,9 +105,9 @@ def handle_user_action(user_id, action):
             "email": user.email,
             "status": user.status,
             "phone": user.phone_number if user.phone_number else "+1 (555) 000-0000",
-            "wallet_balance": str(wallet.balance) if wallet else "0.00",
-            "total_sent": "$" + str(round(total_sent, 2)),
-            "total_received": "$" + str(round(total_received, 2))
+            "wallet_balance": "KES " + str(round(wallet.balance, 2)) if wallet else "KES 0.00",
+            "total_sent": "KES " + str(round(total_sent, 2)),
+            "total_received": "KES " + str(round(total_received, 2))
         }), 200
 
 

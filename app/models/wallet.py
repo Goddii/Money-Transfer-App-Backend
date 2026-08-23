@@ -9,7 +9,7 @@ class Wallet(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
     balance = db.Column(db.Numeric(12, 2), default=0.00)
-    currency = db.Column(db.String(3), default='USD')
+    currency = db.Column(db.String(3), default='KES')  # Default currency is Kenyan Shilling
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
     ledger_entries = db.relationship(
