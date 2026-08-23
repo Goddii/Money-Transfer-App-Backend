@@ -131,8 +131,8 @@ def get_audit_log():
             "status": tx.status,
             "sender_name": sender_user.name if sender_user else "External Bank",
             "receiver_name": receiver_user.name if receiver_user else "System",
-            "amount": "$" + str(tx.amount),
-            "fee": "$" + str(tx.fee),
+            "amount": "KES " + str(tx.amount),
+            "fee": "KES " + str(tx.fee),
             "timestamp": tx.timestamp.strftime("%Y-%m-%d %H:%M")
         })
 
@@ -166,7 +166,7 @@ def get_revenue_analytics():
     for row in source_breakdown_query:
         revenue_source_list.append({
             "source": row.source_type,
-            "amount": "$" + str(round(row.source_total, 2))
+            "amount": "KES " + str(round(row.source_total, 2))
         })
 
     return jsonify({
