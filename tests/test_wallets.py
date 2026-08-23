@@ -153,3 +153,18 @@ def test_database_rejects_duplicate_ledger_reference(app, create_user):
             db.session.commit()
 
         db.session.rollback()
+
+
+def test_new_wallet_defaults_to_kes(app):
+    """Wallets created without an explicit currency must default to KES."""
+    with app.app_context():
+        user = User(first_name="Kes", last_name="Default", email="kesdefault@example.com")
+        user.set_password(DEFAULT_PASSWORD)
+        db.session.add(user)
+        db.session.flush()
+
+        wallet = Wallet(user_id=user.id, balance=Decimal("0.00"))
+        db.session.add(wallet)
+        db.session.commit()
+
+        assert wallet.currency == "KES"
