@@ -1,15 +1,41 @@
 from datetime import datetime
 
 from app.extensions import db
-from app.utils.helpers import money_to_string
+from app.utils.helpers import mask_phone_number, money_to_string
 
 
 class MpesaTransactionStatus:
-    """Lifecycle of an M-Pesa deposit request."""
+    """Lifecycle of an M-Pesa deposit request.
+
+    PENDING              - STK push accepted; awaiting callback/reconciliation.
+    RECONCILIATION_PENDING - Payment may have succeeded but server-side
+                           confirmation is currently inconclusive, unavailable,
+                           or cannot yet be credited safely (for example the
+                           callback reported a different amount). Always
+                           recoverable.
+    COMPLETED            - Daraja server-to-server confirmation succeeded and the
+                           wallet was credited.
+    FAILED               - Payment failure/cancellation definitively established.
+    """
 
     PENDING = 'Pending'
+    RECONCILIATION_PENDING = 'ReconciliationPending'
     COMPLETED = 'Completed'
     FAILED = 'Failed'
+
+    # States from which the deposit can no longer change (terminal).
+    TERMINAL_STATUSES = (COMPLETED, FAILED)
+
+    # States that the recovery service will (re)process.
+    RECOVERABLE_STATUSES = (PENDING, RECONCILIATION_PENDING)
+
+    @classmethod
+    def is_terminal(cls, status):
+        return status in cls.TERMINAL_STATUSES
+
+    @classmethod
+    def is_recoverable(cls, status):
+        return status in cls.RECOVERABLE_STATUSES
 
 
 class MpesaTransaction(db.Model):
@@ -45,6 +71,17 @@ class MpesaTransaction(db.Model):
     result_code = db.Column(db.String(10), nullable=True)
     result_desc = db.Column(db.String(255), nullable=True)
     transaction_date = db.Column(db.String(20), nullable=True)
+    # Reconciliation observability: the most recent Daraja server-to-server
+    # query result and how often/when reconciliation has been attempted.
+    query_result_code = db.Column(db.String(10), nullable=True)
+    query_result_desc = db.Column(db.String(255), nullable=True)
+    reconciliation_attempts = db.Column(
+        db.Integer, nullable=False, default=0, server_default="0"
+    )
+    last_reconciled_at = db.Column(db.DateTime, nullable=True)
+    # The definitive failure reason when FAILED, or why a confirmed payment
+    # could not yet be credited while RECONCILIATION_PENDING.
+    failure_reason = db.Column(db.String(255), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
     updated_at = db.Column(
         db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
@@ -55,11 +92,15 @@ class MpesaTransaction(db.Model):
     transaction = db.relationship('Transaction')
 
     def to_dict(self):
-        """Safe representation. Daraja credentials are never part of this row."""
+        """Safe representation. Daraja credentials are never part of this row.
+
+        The phone number is masked so the internal-facing representation never
+        leaks the full subscriber identifier.
+        """
         return {
             'id': self.id,
             'account_reference': self.account_reference,
-            'phone_number': self.phone_number,
+            'phone_number': mask_phone_number(self.phone_number),
             'amount': money_to_string(self.amount),
             'status': self.status,
             'checkout_request_id': self.checkout_request_id,
@@ -67,4 +108,24 @@ class MpesaTransaction(db.Model):
             'mpesa_receipt_number': self.mpesa_receipt_number,
             'transaction_id': self.transaction_id,
             'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+    def to_status_dict(self):
+        """Public, client-facing status payload for the user status endpoint.
+
+        Deliberately omits ``checkout_request_id`` (not client-facing), merchant
+        and receipt identifiers, and account reference. The phone number is
+        masked. ``reconciliation`` fields are exposed only as coarse,
+        non-sensitive status hints (attempts count and whether a definitive
+        failure exists), never raw Daraja error text.
+        """
+        return {
+            'id': self.id,
+            'amount': money_to_string(self.amount),
+            'status': self.status,
+            'phone_number': mask_phone_number(self.phone_number),
+            'mpesa_receipt_number': self.mpesa_receipt_number,
+            'reconciliation_attempts': self.reconciliation_attempts or 0,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
         }
