@@ -94,3 +94,20 @@ def truncate(value, max_length):
 
     return text[:max_length]
 
+
+def mask_phone_number(value):
+    """Return a privacy-preserving mask of a phone number.
+
+    Keeps only the last four digits so the subscriber cannot be fully
+    identified from an API response. Returns ``None`` for missing input.
+    """
+    if not value:
+        return None
+
+    text = str(value).strip()
+
+    if len(text) <= 4:
+        return "****"
+
+    return f"****{text[-4:]}"
+

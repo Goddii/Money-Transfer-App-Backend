@@ -4,6 +4,8 @@ No test performs a real Daraja request: the outbound HTTP calls made by
 ``app.services.mpesa_service`` are replaced with fakes.
 """
 
+import os
+import threading
 from decimal import Decimal
 
 import pytest
@@ -20,7 +22,10 @@ from app.models import (
     Wallet,
     WalletLedger,
 )
+from app.schemas.mpesa_schema import parse_stk_callback
 from app.services.mpesa_service import MpesaService
+from app.services.wallet_service import WalletService
+from app.utils.errors import ApiError, ErrorCode
 
 STK_PUSH_URL = "/api/mpesa/stk-push"
 CALLBACK_URL = "/api/mpesa/callback"
@@ -28,6 +33,22 @@ CALLBACK_URL = "/api/mpesa/callback"
 CHECKOUT_REQUEST_ID = "ws_CO_20260823010101123456"
 MERCHANT_REQUEST_ID = "29115-34620561-1"
 RECEIPT_NUMBER = "QK12AB34CD"
+
+# ``with_for_update()`` is silently ignored by SQLite, so the callback/recovery
+# concurrency regression can only be verified against PostgreSQL. Point
+# ``TEST_DATABASE_URL`` at a disposable PostgreSQL database to run it.
+_TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL", "")
+_POSTGRES_TEST_DB = _TEST_DATABASE_URL.startswith(
+    ("postgresql://", "postgresql+", "postgres://")
+)
+
+requires_postgres = pytest.mark.skipif(
+    not _POSTGRES_TEST_DB,
+    reason=(
+        "row locking is a no-op on SQLite; set TEST_DATABASE_URL to a "
+        "non-production PostgreSQL database to run this concurrency regression"
+    ),
+)
 
 
 class _FakeResponse:
@@ -401,7 +422,12 @@ def test_successful_callback_credits_wallet_once(
 
         assert len(entries) == 1
         assert entries[0].entry_type == LedgerEntryType.CREDIT
-        assert entries[0].reference == RECEIPT_NUMBER
+        # The canonical idempotency reference is the Daraja checkout id, which
+        # both the callback and the recovery path use, so
+        # ``unique_wallet_ledger_reference`` can block a duplicate credit from
+        # either path. The receipt is still stored on the deposit row.
+        assert entries[0].reference == CHECKOUT_REQUEST_ID
+        assert deposit.mpesa_receipt_number == RECEIPT_NUMBER
         assert Decimal(str(entries[0].balance_before)) == Decimal("10.00")
         assert Decimal(str(entries[0].balance_after)) == Decimal("510.00")
 
@@ -487,9 +513,16 @@ def test_callback_after_failed_reconciliation_is_not_reprocessed(
 def test_callback_with_mismatched_amount_does_not_credit_wallet(
     client, app, authenticated_user, fake_daraja
 ):
+    """F/Test B: a confirmed payment with a mismatched callback amount.
+
+    Daraja's authoritative query says the payment succeeded, so this is NOT
+    evidence of non-payment: the deposit must stay recoverable and uncredited,
+    never terminal FAILED.
+    """
     user, headers = authenticated_user(email="depositor@example.com", balance="10.00")
     _initiate_deposit(client, headers, fake_daraja, amount="500")
 
+    # Default fake query returns ResultCode 0 (payment confirmed).
     response = client.post(CALLBACK_URL, json=_callback_payload(amount=100000))
 
     assert response.status_code == 200
@@ -497,8 +530,14 @@ def test_callback_with_mismatched_amount_does_not_credit_wallet(
     assert _balance(app, user["id"]) == Decimal("10.00")
 
     with app.app_context():
-        assert MpesaTransaction.query.one().status == MpesaTransactionStatus.FAILED
+        stored = MpesaTransaction.query.one()
+
+        assert stored.status == MpesaTransactionStatus.RECONCILIATION_PENDING
+        assert stored.failure_reason is not None
+        assert "mismatch" in stored.failure_reason.lower()
+        assert stored.reconciliation_attempts >= 1
         assert Transaction.query.count() == 0
+        assert WalletLedger.query.count() == 0
 
 
 def test_callback_for_unknown_checkout_id_is_ignored(
@@ -625,14 +664,15 @@ def test_correct_checkout_id_alone_is_insufficient_to_credit(
         assert MpesaTransaction.query.one().status == MpesaTransactionStatus.FAILED
 
 
-def test_reconciliation_failure_keeps_deposit_pending_for_retry(
+def test_reconciliation_failure_keeps_deposit_recoverable_for_retry(
     client, app, authenticated_user, fake_daraja
 ):
     user, headers = authenticated_user(email="depositor@example.com", balance="10.00")
     _initiate_deposit(client, headers, fake_daraja)
 
-    # Daraja cannot be reached; the deposit must stay PENDING (not fail, not
-    # credit) so a later callback retry can still reconcile it.
+    # Daraja cannot be reached; the deposit must move to RECONCILIATION_PENDING
+    # (not fail, not credit) so a later callback retry or reconciliation can
+    # still recover it. This is the key remediation of the stranding bug.
     fake_daraja(raise_on_query=True)
 
     response = client.post(CALLBACK_URL, json=_callback_payload())
@@ -641,7 +681,11 @@ def test_reconciliation_failure_keeps_deposit_pending_for_retry(
     assert _balance(app, user["id"]) == Decimal("10.00")
 
     with app.app_context():
-        assert MpesaTransaction.query.one().status == MpesaTransactionStatus.PENDING
+        stored = MpesaTransaction.query.one()
+
+        assert stored.status == MpesaTransactionStatus.RECONCILIATION_PENDING
+        assert stored.reconciliation_attempts >= 1
+        assert stored.last_reconciled_at is not None
 
 
 def test_genuine_confirmed_reconciliation_credits_wallet(
@@ -764,3 +808,653 @@ def test_callback_allowed_when_source_matches_allowlist(
 
     assert response.status_code == 200
     assert _balance(app, user["id"]) == Decimal("510.00")
+
+
+# --- RECONCILIATION_PENDING remediation --------------------------------
+
+
+def test_incident_regression_inconclusive_query_is_recoverable_not_failed(
+    client, app, authenticated_user, fake_daraja
+):
+    """B: callback success + inconclusive query must NOT become FAILED.
+
+    This is the exact stranding bug. The deposit must land in
+    RECONCILIATION_PENDING, the wallet must be untouched, and no
+    Transaction/WalletLedger must be created.
+    """
+    user, headers = authenticated_user(email="depositor@example.com", balance="10.00")
+    _initiate_deposit(client, headers, fake_daraja)
+
+    fake_daraja(
+        query_response={
+            "ResultCode": "9999",
+            "ResultDesc": "Inconclusive / unknown result",
+        }
+    )
+
+    response = client.post(CALLBACK_URL, json=_callback_payload(result_code=0))
+
+    assert response.status_code == 200
+    assert _balance(app, user["id"]) == Decimal("10.00")
+
+    with app.app_context():
+        stored = MpesaTransaction.query.one()
+
+        assert stored.status == MpesaTransactionStatus.RECONCILIATION_PENDING
+        # Observability fields are persisted.
+        assert stored.query_result_code == "9999"
+        assert stored.reconciliation_attempts == 1
+        assert stored.last_reconciled_at is not None
+        assert Transaction.query.count() == 0
+        assert WalletLedger.query.count() == 0
+
+
+def test_unknown_nonzero_query_response_stays_recoverable(
+    client, app, authenticated_user, fake_daraja
+):
+    """G: an unrecognised non-zero query code must never auto-become FAILED."""
+    user, headers = authenticated_user(email="depositor@example.com", balance="10.00")
+    _initiate_deposit(client, headers, fake_daraja)
+
+    fake_daraja(
+        query_response={
+            "ResultCode": "1037",
+            "ResultDesc": "DS timeout (treated as inconclusive here)",
+        }
+    )
+
+    client.post(CALLBACK_URL, json=_callback_payload(result_code=0))
+
+    assert _balance(app, user["id"]) == Decimal("10.00")
+
+    with app.app_context():
+        stored = MpesaTransaction.query.one()
+
+        assert stored.status == MpesaTransactionStatus.RECONCILIATION_PENDING
+        assert stored.query_result_code == "1037"
+        assert Transaction.query.count() == 0
+
+
+def test_genuine_cancellation_marks_failed_no_credit(
+    client, app, authenticated_user, fake_daraja
+):
+    """F: the documented definitive cancellation (1032) becomes FAILED."""
+    user, headers = authenticated_user(email="depositor@example.com", balance="10.00")
+    _initiate_deposit(client, headers, fake_daraja)
+
+    fake_daraja(
+        query_response={
+            "ResultCode": "1032",
+            "ResultDesc": "Request cancelled by user",
+        }
+    )
+
+    response = client.post(CALLBACK_URL, json=_callback_payload(result_code=0))
+
+    assert response.status_code == 200
+    assert _balance(app, user["id"]) == Decimal("10.00")
+
+    with app.app_context():
+        stored = MpesaTransaction.query.one()
+
+        assert stored.status == MpesaTransactionStatus.FAILED
+        assert stored.failure_reason == "Request cancelled by user"
+        assert Transaction.query.count() == 0
+        assert WalletLedger.query.count() == 0
+
+
+def test_reconciliation_pending_is_recoverable_via_recovery(
+    client, app, authenticated_user, fake_daraja
+):
+    """C: first reconciliation inconclusive, later reconciliation succeeds."""
+    user, headers = authenticated_user(email="depositor@example.com", balance="10.00")
+    with app.app_context():
+        wallet = Wallet.query.filter_by(user_id=user["id"]).first()
+        mpesa_transaction = MpesaTransaction(
+            user_id=user["id"],
+            wallet_id=wallet.id,
+            account_reference="REFRECOVER",
+            phone_number="254712345678",
+            amount=Decimal("500.00"),
+            status=MpesaTransactionStatus.RECONCILIATION_PENDING,
+            checkout_request_id="ws_CO_recover_3",
+        )
+        db.session.add(mpesa_transaction)
+        db.session.commit()
+
+    # First recovery attempt: inconclusive.
+    fake_daraja(
+        query_response={
+            "ResultCode": "9999",
+            "ResultDesc": "Inconclusive",
+        }
+    )
+    summary = MpesaService.recover_deposits()
+    assert summary["reconciliation_pending"] == 1
+    assert summary["credited"] == 0
+    assert _balance(app, user["id"]) == Decimal("10.00")
+
+    # Later recovery attempt: Daraja confirms success.
+    fake_daraja(query_response={"ResultCode": "0", "ResultDesc": "Success."})
+    summary = MpesaService.recover_deposits()
+    assert summary["credited"] == 1
+
+    assert _balance(app, user["id"]) == Decimal("510.00")
+
+    with app.app_context():
+        stored = MpesaTransaction.query.filter_by(
+            checkout_request_id="ws_CO_recover_3"
+        ).first()
+
+        assert stored.status == MpesaTransactionStatus.COMPLETED
+        assert Transaction.query.count() == 1
+        assert WalletLedger.query.count() == 1
+
+
+def test_recovery_timeout_keeps_deposit_recoverable(
+    client, app, authenticated_user, fake_daraja
+):
+    """H: a Daraja query timeout/API error leaves the deposit recoverable."""
+    user, headers = authenticated_user(email="depositor@example.com", balance="10.00")
+    with app.app_context():
+        wallet = Wallet.query.filter_by(user_id=user["id"]).first()
+        mpesa_transaction = MpesaTransaction(
+            user_id=user["id"],
+            wallet_id=wallet.id,
+            account_reference="REFRECOVER",
+            phone_number="254712345678",
+            amount=Decimal("500.00"),
+            status=MpesaTransactionStatus.RECONCILIATION_PENDING,
+            checkout_request_id="ws_CO_recover_4",
+        )
+        db.session.add(mpesa_transaction)
+        db.session.commit()
+
+    fake_daraja(raise_on_query=True)
+    summary = MpesaService.recover_deposits()
+
+    assert summary["reconciliation_pending"] == 1
+    assert summary["credited"] == 0
+    assert _balance(app, user["id"]) == Decimal("10.00")
+
+    with app.app_context():
+        stored = MpesaTransaction.query.filter_by(
+            checkout_request_id="ws_CO_recover_4"
+        ).first()
+
+        assert stored.status == MpesaTransactionStatus.RECONCILIATION_PENDING
+        assert stored.reconciliation_attempts >= 1
+
+
+def test_duplicate_recovery_does_not_double_credit(
+    client, app, authenticated_user, fake_daraja
+):
+    """E: running recovery repeatedly against a completed deposit credits once."""
+    user, headers = authenticated_user(email="depositor@example.com", balance="10.00")
+    fake_daraja(query_response={"ResultCode": "0", "ResultDesc": "Success."})
+
+    with app.app_context():
+        wallet = Wallet.query.filter_by(user_id=user["id"]).first()
+        mpesa_transaction = MpesaTransaction(
+            user_id=user["id"],
+            wallet_id=wallet.id,
+            account_reference="REFRECOVER",
+            phone_number="254712345678",
+            amount=Decimal("500.00"),
+            status=MpesaTransactionStatus.PENDING,
+            checkout_request_id="ws_CO_recover_5",
+        )
+        db.session.add(mpesa_transaction)
+        db.session.commit()
+
+    first = MpesaService.recover_deposits()
+    second = MpesaService.recover_deposits()
+    third = MpesaService.recover_deposits()
+
+    assert first["credited"] == 1
+    assert second["credited"] == 0
+    assert third["credited"] == 0
+
+    assert _balance(app, user["id"]) == Decimal("510.00")
+
+    with app.app_context():
+        assert Transaction.query.count() == 1
+        assert WalletLedger.query.count() == 1
+
+
+def test_reconciliation_pending_reprocessed_by_callback_recovers(
+    client, app, authenticated_user, fake_daraja
+):
+    """A RECONCILIATION_PENDING deposit can be completed by a later callback."""
+    user, headers = authenticated_user(email="depositor@example.com", balance="10.00")
+    _initiate_deposit(client, headers, fake_daraja)
+
+    # First callback: inconclusive query -> RECONCILIATION_PENDING.
+    fake_daraja(query_response={"ResultCode": "9999", "ResultDesc": "Inconclusive"})
+    client.post(CALLBACK_URL, json=_callback_payload(result_code=0))
+
+    assert _balance(app, user["id"]) == Decimal("10.00")
+    with app.app_context():
+        assert (
+            MpesaTransaction.query.one().status
+            == MpesaTransactionStatus.RECONCILIATION_PENDING
+        )
+
+    # Later callback: Daraja now confirms success.
+    fake_daraja(query_response={"ResultCode": "0", "ResultDesc": "Success."})
+    client.post(CALLBACK_URL, json=_callback_payload(result_code=0))
+
+    assert _balance(app, user["id"]) == Decimal("510.00")
+    with app.app_context():
+        stored = MpesaTransaction.query.one()
+
+        assert stored.status == MpesaTransactionStatus.COMPLETED
+        assert Transaction.query.count() == 1
+        assert WalletLedger.query.count() == 1
+
+
+# --- user status + admin recovery endpoints -----------------------------
+
+
+def test_user_can_fetch_own_mpesa_transaction_status(
+    client, app, authenticated_user, fake_daraja
+):
+    _, headers = authenticated_user(email="depositor@example.com", balance="10.00")
+    deposit = _initiate_deposit(client, headers, fake_daraja)
+
+    response = client.get(
+        f"/api/mpesa/transactions/{deposit['id']}", headers=headers
+    )
+
+    assert response.status_code == 200
+    body = response.get_json()["data"]["transaction"]
+
+    assert body["id"] == deposit["id"]
+    assert body["status"] == MpesaTransactionStatus.PENDING
+    # checkout_request_id must NOT be returned; phone must be masked.
+    assert "checkout_request_id" not in body
+    assert body["phone_number"].startswith("****")
+    assert len(body["phone_number"]) <= 8
+
+
+def test_user_cannot_fetch_another_users_mpesa_transaction(
+    client, app, authenticated_user, fake_daraja, create_user, login
+):
+    owner, owner_headers = authenticated_user(
+        email="owner@example.com", balance="10.00"
+    )
+    deposit = _initiate_deposit(client, owner_headers, fake_daraja)
+
+    other = create_user(email="other@example.com", balance="10.00")
+    other_headers = login(other["email"], other["password"])
+
+    # Client-facing id is the transaction primary key (scoped to owner).
+    response = client.get(
+        f"/api/mpesa/transactions/{deposit['id']}", headers=other_headers
+    )
+
+    # Reported as not found so the existence of another user's deposit is hidden.
+    assert response.status_code == 404
+
+
+def test_unauthenticated_status_request_is_rejected(client, fake_daraja):
+    fake_daraja()
+    response = client.get("/api/mpesa/transactions/1")
+
+    assert response.status_code == 401
+
+
+def test_admin_reconcile_runs_recovery_safely(
+    client, app, authenticated_user, fake_daraja, create_user, login
+):
+    admin = create_user(email="admin@example.com", role="admin", balance="0.00")
+    admin_headers = login(admin["email"], admin["password"])
+
+    user, _ = authenticated_user(email="depositor@example.com", balance="10.00")
+    fake_daraja(query_response={"ResultCode": "0", "ResultDesc": "Success."})
+
+    with app.app_context():
+        wallet = Wallet.query.filter_by(user_id=user["id"]).first()
+        mpesa_transaction = MpesaTransaction(
+            user_id=user["id"],
+            wallet_id=wallet.id,
+            account_reference="REFRECOVER",
+            phone_number="254712345678",
+            amount=Decimal("500.00"),
+            status=MpesaTransactionStatus.RECONCILIATION_PENDING,
+            checkout_request_id="ws_CO_recover_admin",
+        )
+        db.session.add(mpesa_transaction)
+        db.session.commit()
+
+    response = client.post("/api/mpesa/admin/reconcile", headers=admin_headers)
+
+    assert response.status_code == 200
+    summary = response.get_json()["data"]["summary"]
+
+    assert summary["credited"] == 1
+
+    # Running again is safe/idempotent: nothing new is credited.
+    response2 = client.post("/api/mpesa/admin/reconcile", headers=admin_headers)
+    assert response2.get_json()["data"]["summary"]["credited"] == 0
+
+    assert _balance(app, user["id"]) == Decimal("510.00")
+
+
+def test_admin_reconcile_requires_admin_role(
+    client, authenticated_user, fake_daraja
+):
+    _, headers = authenticated_user(email="depositor@example.com", balance="10.00")
+
+    response = client.post("/api/mpesa/admin/reconcile", headers=headers)
+
+    assert response.status_code == 403
+
+
+# --- atomicity ----------------------------------------------------------
+
+
+def test_credit_failure_rolls_back_atomically(
+    client, app, authenticated_user, fake_daraja, monkeypatch
+):
+    """J: a failure during crediting rolls back with no partial state."""
+    from sqlalchemy.exc import SQLAlchemyError as _SAErr
+
+    from app.services import wallet_service as _ws
+
+    def _boom(*args, **kwargs):
+        raise _SAErr("simulated DB failure")
+
+    monkeypatch.setattr(_ws.WalletService, "credit", _boom)
+
+    user, headers = authenticated_user(email="depositor@example.com", balance="10.00")
+    _initiate_deposit(client, headers, fake_daraja)
+
+    fake_daraja(query_response={"ResultCode": "0", "ResultDesc": "Success."})
+
+    # The endpoint returns an error but must not persist any partial credit.
+    response = client.post(CALLBACK_URL, json=_callback_payload(result_code=0))
+
+    assert response.status_code == 500
+    assert _balance(app, user["id"]) == Decimal("10.00")
+
+    with app.app_context():
+        # No transaction or ledger was committed; the deposit remains pending
+        # (rolled back to its pre-callback state).
+        stored = MpesaTransaction.query.one()
+
+        assert stored.status == MpesaTransactionStatus.PENDING
+        assert Transaction.query.count() == 0
+        assert WalletLedger.query.count() == 0
+
+
+# --- PART C/A: double-credit regression (terminal guard, two sessions) -----
+
+
+def _make_pending_deposit(app, user_id, checkout_request_id, amount="500.00"):
+    """Create a PENDING M-Pesa deposit row directly (no Daraja call)."""
+    with app.app_context():
+        wallet = Wallet.query.filter_by(user_id=user_id).first()
+        mpesa_transaction = MpesaTransaction(
+            user_id=user_id,
+            wallet_id=wallet.id,
+            account_reference="REFRECOVER",
+            phone_number="254712345678",
+            amount=Decimal(amount),
+            status=MpesaTransactionStatus.PENDING,
+            merchant_request_id="29115-34620561-1",
+            checkout_request_id=checkout_request_id,
+        )
+        db.session.add(mpesa_transaction)
+        db.session.commit()
+
+    return checkout_request_id
+
+
+def test_credit_confirmed_deposit_refuses_already_terminal(
+    app, create_user
+):
+    """PART C direct regression: crediting an already-terminal M-Pesa deposit
+    (Completed *or* Failed) must never add a wallet credit, Transaction, or
+    ledger entry. This is the deepest defence-in-depth guard: even a caller
+    holding stale state cannot re-credit a finished deposit.
+    """
+    user = create_user(email="terminal@example.com", balance="1000.00")
+    user_id = user["id"]
+
+    for terminal_status in (
+        MpesaTransactionStatus.COMPLETED,
+        MpesaTransactionStatus.FAILED,
+    ):
+        cid = f"ws_CO_term_{terminal_status}"
+        with app.app_context():
+            wallet = Wallet.query.filter_by(user_id=user_id).first()
+            mpesa_transaction = MpesaTransaction(
+                user_id=user_id,
+                wallet_id=wallet.id,
+                account_reference="REFTERM",
+                phone_number="254712345678",
+                amount=Decimal("500.00"),
+                status=terminal_status,
+                merchant_request_id="29115-34620561-1",
+                checkout_request_id=cid,
+            )
+            db.session.add(mpesa_transaction)
+            db.session.commit()
+
+            before_balance = Decimal(
+                str(Wallet.query.filter_by(user_id=user_id).first().balance)
+            )
+
+        # Re-read in a fresh session so the object is bound (and not expired by
+        # the previous commit) before exercising the credit path.
+        with app.app_context():
+            mtx = MpesaTransaction.query.filter_by(
+                checkout_request_id=cid
+            ).first()
+            result = MpesaService._credit_confirmed_deposit(
+                mtx,
+                callback_amount=500,
+                receipt_number="QKTERM99",
+            )
+            assert result.status == terminal_status
+            # Nothing was created and nothing was credited.
+            assert Transaction.query.count() == 0
+            assert WalletLedger.query.count() == 0
+            after_balance = Decimal(
+                str(Wallet.query.filter_by(user_id=user_id).first().balance)
+            )
+
+        assert after_balance == before_balance
+
+
+def test_separate_sessions_callback_then_recovery_single_credit(
+    app, create_user, fake_daraja
+):
+    """PART C companion regression, runnable on SQLite: the callback (its own
+    database session/transaction) credits and commits, then the recovery sweep
+    (a *different* session) re-reads the deposit under its terminal-state guard
+    and skips it. This proves the cross-session re-check prevents a double
+    credit even without true lock contention, and executes everywhere.
+    """
+    fake_daraja(query_response={"ResultCode": "0", "ResultDesc": "Success."})
+
+    user = create_user(email="twosession@example.com", balance="1000.00")
+    user_id = user["id"]
+    cid = "ws_CO_twosession"
+    _make_pending_deposit(app, user_id, cid)
+
+    def run_callback():
+        with app.app_context():
+            parsed = parse_stk_callback(
+                _callback_payload(result_code=0, checkout_request_id=cid)
+            )
+            MpesaService.process_callback(parsed)
+
+    cb_thread = threading.Thread(target=run_callback)
+    cb_thread.start()
+    cb_thread.join(timeout=15)
+
+    summary = MpesaService.recover_deposits()
+
+    with app.app_context():
+        wallet = Wallet.query.filter_by(user_id=user_id).first()
+        assert Decimal(str(wallet.balance)) == Decimal("1500.00")
+        stored = MpesaTransaction.query.filter_by(checkout_request_id=cid).first()
+        assert stored.status == MpesaTransactionStatus.COMPLETED
+        assert Transaction.query.count() == 1
+        assert WalletLedger.query.count() == 1
+
+    # The row is already COMPLETED, so it is no longer a recovery candidate;
+    # the sweep must not credit it a second time.
+    assert summary["credited"] == 0
+    assert summary["processed"] == 0
+
+
+@requires_postgres
+def test_concurrent_callback_and_recovery_single_credit(
+    app, create_user, monkeypatch
+):
+    """PART C/D MANDATORY regression: a callback and a recovery sweep racing on
+    the same deposit must produce exactly ONE wallet credit, ONE ledger entry,
+    ONE Transaction, and a single COMPLETED state.
+
+    Two real, separate database sessions are used (one per thread; Flask-
+    SQLAlchemy's ``db.session`` is thread-local). The recovery thread issues its
+    authenticated Daraja query (ResultCode 0) and then *waits* for the callback
+    to finish its credit+commit before taking the row lock. Under PostgreSQL
+    ``SELECT ... FOR UPDATE`` serialises the two workers: the recovery thread
+    blocks on the row lock until the callback commits, then re-reads the now
+    COMPLETED status and skips. The deposit is therefore credited exactly once.
+
+    Skipped on SQLite because ``with_for_update()`` is a no-op there and the
+    true lock-based race cannot be exercised; set ``TEST_DATABASE_URL`` to a
+    disposable PostgreSQL database to run it.
+    """
+    import threading
+
+    user = create_user(email="race@example.com", balance="1000.00")
+    user_id = user["id"]
+    cid = "ws_CO_race_1"
+    _make_pending_deposit(app, user_id, cid)
+
+    recovered_queried = threading.Event()
+    callback_committed = threading.Event()
+    result_holder = {}
+
+    recovery_thread = None
+
+    def fake_query(checkout_request_id):
+        if threading.current_thread() is recovery_thread:
+            # Recovery has sent its Daraja query (ResultCode 0) but has not yet
+            # taken the row lock. Signal the harness and wait for the callback to
+            # finish its credit + commit before continuing.
+            recovered_queried.set()
+            callback_committed.wait(timeout=15)
+            return {"ResultCode": "0", "ResultDesc": "Success."}
+        return {"ResultCode": "0", "ResultDesc": "Success."}
+
+    # Bypass the network entirely; the query result is what authorises a credit,
+    # so the fake returns the same confirmed-success payload both threads trust.
+    monkeypatch.setattr(
+        MpesaService, "query_stk_status", staticmethod(fake_query)
+    )
+
+    def run_recovery():
+        with app.app_context():
+            result_holder["summary"] = MpesaService.recover_deposits()
+
+    def run_callback():
+        with app.app_context():
+            parsed = parse_stk_callback(
+                _callback_payload(result_code=0, checkout_request_id=cid)
+            )
+            MpesaService.process_callback(parsed)
+
+    recovery_thread = threading.Thread(target=run_recovery, name="recovery")
+    recovery_thread.start()
+    # Wait until recovery has issued its Daraja query (before the row lock).
+    assert recovered_queried.wait(timeout=15)
+
+    callback_thread = threading.Thread(target=run_callback, name="callback")
+    callback_thread.start()
+    callback_thread.join(timeout=15)
+    # Release the recovery thread now that the callback has committed.
+    callback_committed.set()
+    recovery_thread.join(timeout=15)
+
+    with app.app_context():
+        wallet = Wallet.query.filter_by(user_id=user_id).first()
+        assert Decimal(str(wallet.balance)) == Decimal("1500.00")
+        stored = MpesaTransaction.query.filter_by(checkout_request_id=cid).first()
+        assert stored.status == MpesaTransactionStatus.COMPLETED
+        assert Transaction.query.count() == 1
+        assert WalletLedger.query.count() == 1
+
+    # Recovery explicitly did NOT credit; it skipped the completed row.
+    assert result_holder["summary"]["credited"] == 0
+    assert result_holder["summary"]["skipped"] == 1
+
+
+# --- PART G: recovery sweep must isolate one failing row --------------------
+
+
+def test_recovery_sweep_isolates_row_failure(
+    app, create_user, fake_daraja, monkeypatch
+):
+    """PART G regression: a single row whose credit raises must NOT abort the
+    sweep or roll back the rows that already committed. The remaining rows still
+    process; the failing row stays recoverable (never terminal, never credited).
+    """
+    fake_daraja(query_response={"ResultCode": "0", "ResultDesc": "Success."})
+
+    user = create_user(email="sweep@example.com", balance="1000.00")
+    user_id = user["id"]
+
+    cids = ["ws_CO_sweep_a", "ws_CO_sweep_bad", "ws_CO_sweep_c"]
+    for cid in cids:
+        _make_pending_deposit(app, user_id, cid)
+
+    orig_credit = MpesaService._credit_confirmed_deposit
+
+    def _boom(mpesa_transaction, callback_amount=None, receipt_number=None):
+        if mpesa_transaction.checkout_request_id == "ws_CO_sweep_bad":
+            # Simulated downstream failure for exactly one deposit.
+            raise ApiError(
+                "simulated downstream failure",
+                500,
+                ErrorCode.MPESA_REQUEST_FAILED,
+            )
+        return orig_credit(
+            mpesa_transaction,
+            callback_amount=callback_amount,
+            receipt_number=receipt_number,
+        )
+
+    monkeypatch.setattr(
+        MpesaService, "_credit_confirmed_deposit", staticmethod(_boom)
+    )
+
+    summary = MpesaService.recover_deposits()
+
+    assert summary["processed"] == 3
+    assert summary["credited"] == 2
+    assert summary["errors"] == 1
+
+    with app.app_context():
+        wallet = Wallet.query.filter_by(user_id=user_id).first()
+        # Two successful credits of 500 each, on top of the starting 1000.
+        assert Decimal(str(wallet.balance)) == Decimal("2000.00")
+        assert Transaction.query.count() == 2
+        assert WalletLedger.query.count() == 2
+
+        bad = MpesaTransaction.query.filter_by(
+            checkout_request_id="ws_CO_sweep_bad"
+        ).first()
+        # The bad row is rolled back in isolation and remains recoverable.
+        assert not MpesaTransactionStatus.is_terminal(bad.status)
+
+        good = MpesaTransaction.query.filter_by(
+            checkout_request_id="ws_CO_sweep_a"
+        ).first()
+        assert good.status == MpesaTransactionStatus.COMPLETED
