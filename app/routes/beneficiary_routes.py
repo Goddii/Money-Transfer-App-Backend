@@ -44,7 +44,7 @@ def create_beneficiary():
 
     beneficiary = BeneficiaryService.create(
         owner=current_user,
-        beneficiary_user_id=validated_data["beneficiary_user_id"],
+        identifier=validated_data,
     )
 
     return success_response(

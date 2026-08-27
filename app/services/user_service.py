@@ -1,6 +1,7 @@
 from app.extensions import db
 from app.models import MpesaTransaction, Transaction, User
 from app.utils.errors import ApiError, ErrorCode
+from app.utils.validators import normalize_kenyan_phone
 
 
 class UserService:
@@ -8,6 +9,39 @@ class UserService:
     @staticmethod
     def get_user_by_id(user_id):
         return db.session.get(User, user_id)
+
+    @staticmethod
+    def find_by_public_identifier(phone_number=None, email=None):
+        """Resolve a user-facing account identifier to a single user.
+
+        ``email`` is matched case-insensitively and is guaranteed unique and
+        present for every account. ``phone_number`` is matched against the exact
+        submitted (canonical) value, with a fallback that normalises each stored
+        value so differing formats (``07...`` vs ``254...`` vs ``+254...``) still
+        match.
+
+        Returns the :class:`User` or ``None`` when no account matches.
+        """
+        if email:
+            return User.query.filter(User.email.ilike(email)).first()
+
+        if phone_number:
+            # Fast path: exact match on the canonical normalised value.
+            exact = User.query.filter(User.phone_number == phone_number).first()
+            if exact:
+                return exact
+
+            # Fallback: normalise each stored value (handles 07... vs 254... vs
+            # +254... forms) and compare against the already-normalised input.
+            for user in User.query.filter(User.phone_number.isnot(None)).all():
+                try:
+                    normalised_stored = normalize_kenyan_phone(user.phone_number)
+                except ApiError:
+                    continue
+                if normalised_stored == phone_number:
+                    return user
+
+        return None
 
     @staticmethod
     def update_user(user, first_name=None, last_name=None, phone_number=None):

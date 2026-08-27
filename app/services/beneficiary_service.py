@@ -9,6 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from app.extensions import db
 from app.models.beneficiary import Beneficiary
 from app.models.user import User
+from app.services.user_service import UserService
 from app.utils.errors import ApiError, ErrorCode
 from app.utils.helpers import is_account_active
 
@@ -24,19 +25,40 @@ class BeneficiaryService:
         )
 
     @staticmethod
-    def create(owner, beneficiary_user_id):
+    def create(owner, identifier):
+        """Add a beneficiary for ``owner``.
+
+        ``identifier`` is the dict returned by
+        :func:`app.schemas.beneficiary_schema.validate_beneficiary_create` and
+        names exactly one account identifier (``beneficiary_user_id``,
+        ``phone_number`` or ``email``). The internal user id is resolved here so
+        the client never has to know or supply it.
+        """
+        if "beneficiary_user_id" in identifier:
+            beneficiary_user_id = identifier["beneficiary_user_id"]
+            beneficiary_user = db.session.get(User, beneficiary_user_id)
+            if not beneficiary_user:
+                raise ApiError(
+                    "Beneficiary user not found.", 404, ErrorCode.USER_NOT_FOUND
+                )
+        else:
+            beneficiary_user = UserService.find_by_public_identifier(
+                phone_number=identifier.get("phone_number"),
+                email=identifier.get("email"),
+            )
+            if not beneficiary_user:
+                raise ApiError(
+                    "No Vyloc account was found for that phone number or email.",
+                    404,
+                    ErrorCode.USER_NOT_FOUND,
+                )
+            beneficiary_user_id = beneficiary_user.id
+
         if beneficiary_user_id == owner.id:
             raise ApiError(
                 "You cannot add yourself as a beneficiary.",
                 400,
                 ErrorCode.SELF_BENEFICIARY_NOT_ALLOWED,
-            )
-
-        beneficiary_user = db.session.get(User, beneficiary_user_id)
-
-        if not beneficiary_user:
-            raise ApiError(
-                "Beneficiary user not found.", 404, ErrorCode.USER_NOT_FOUND
             )
 
         if not is_account_active(beneficiary_user):
