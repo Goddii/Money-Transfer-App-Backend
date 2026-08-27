@@ -2,6 +2,7 @@
 
 from flask import Blueprint
 
+from app.services.analytics_service import AnalyticsService
 from app.services.wallet_service import WalletService
 from app.utils.decorators import get_current_user, handle_api_errors, jwt_required_custom
 from app.utils.errors import success_response
@@ -31,4 +32,20 @@ def get_my_wallet():
     return success_response(
         message="Wallet retrieved successfully.",
         data={"wallet": wallet.to_dict()},
+    )
+
+
+@wallet_bp.get("/analytics")
+@jwt_required_custom
+@handle_api_errors
+def get_wallet_analytics():
+    """Return aggregate analytics for the authenticated user's wallet."""
+
+    current_user = get_current_user()
+
+    analytics = AnalyticsService.user_wallet_analytics(current_user.id)
+
+    return success_response(
+        message="Wallet analytics retrieved successfully.",
+        data={"analytics": analytics},
     )
