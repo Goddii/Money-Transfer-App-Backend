@@ -97,13 +97,9 @@ def test_admin_revenue_analytics_presents_amounts_in_kes(
 ):
     """Revenue-by-source monetary values must be presented in KES, not '$'.
 
-    The route relies on PostgreSQL's ``to_char`` for monthly grouping, so this
-    test is only meaningful against PostgreSQL; skip it on SQLite.
+    The route now aggregates fees in Python so it runs on both SQLite and
+    PostgreSQL without dialect-specific functions.
     """
-    with app.app_context():
-        if db.engine.dialect.name == "sqlite":
-            pytest.skip("revenue-analytics uses PostgreSQL to_char")
-
     admin, headers = authenticated_user(email="admin2@example.com", role="admin")
 
     with app.app_context():
