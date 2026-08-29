@@ -46,6 +46,13 @@ def create_app(config_object=Config):
 
     register_error_handlers(app)
 
+    # Start the background reconciliation sweep (no-op under TESTING). This is the
+    # fix for deposits stranded in PENDING / RECONCILIATION_PENDING when a
+    # callback never arrives or arrives before Daraja finalises the payment.
+    from app.services.mpesa_service import MpesaService
+
+    MpesaService.start_reconciliation_sweeper(app)
+
     @app.get('/')
     def health_check():
         return {

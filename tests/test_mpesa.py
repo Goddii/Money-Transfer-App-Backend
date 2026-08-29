@@ -4,14 +4,18 @@ No test performs a real Daraja request: the outbound HTTP calls made by
 ``app.services.mpesa_service`` are replaced with fakes.
 """
 
+import logging
 import os
 import threading
+import time
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 import pytest
 import requests
 from sqlalchemy import event
 
+from app import create_app
 from app.extensions import db
 from app.models import (
     LedgerEntryType,
@@ -19,6 +23,7 @@ from app.models import (
     MpesaTransactionStatus,
     Transaction,
     TransactionType,
+    User,
     Wallet,
     WalletLedger,
 )
@@ -1458,3 +1463,567 @@ def test_recovery_sweep_isolates_row_failure(
             checkout_request_id="ws_CO_sweep_a"
         ).first()
         assert good.status == MpesaTransactionStatus.COMPLETED
+
+
+# --- automatic recovery gap (the intermittent stranding bug) -----------------
+
+
+def test_inconclusive_callback_is_recoverable_and_user_reconcile_credits(
+    client, app, authenticated_user, fake_daraja
+):
+    """Core race repro: callback arrives before Daraja finalises the payment.
+
+    The callback reaches the backend while Daraja's live query is still
+    inconclusive (ResultCode != 0 and not a definitive failure). The deposit
+    lands in ``RECONCILIATION_PENDING``. Critically, the *frontend must not see
+    failure* -- it sees a recoverable state -- and the user-scoped reconcile
+    endpoint later credits the wallet once Daraja confirms. This is exactly the
+    "paid but not credited" intermittent failure.
+    """
+    user, headers = authenticated_user(email="depositor@example.com", balance="10.00")
+    _initiate_deposit(client, headers, fake_daraja)
+
+    # Callback arrives; Daraja's authoritative query is still inconclusive.
+    fake_daraja(query_response={"ResultCode": "9999", "ResultDesc": "Inconclusive"})
+    client.post(CALLBACK_URL, json=_callback_payload(result_code=0))
+
+    # Frontend polls: it must see RECONCILIATION_PENDING, never Failed.
+    status_resp = client.get("/api/mpesa/transactions/1", headers=headers)
+    assert (
+        status_resp.get_json()["data"]["transaction"]["status"]
+        == MpesaTransactionStatus.RECONCILIATION_PENDING
+    )
+    # Wallet is still untouched -- no premature or phantom credit.
+    assert _balance(app, user["id"]) == Decimal("10.00")
+
+    # Later, the user (or a frontend nudge) triggers reconciliation; Daraja now
+    # confirms success and the wallet is credited exactly once.
+    fake_daraja(query_response={"ResultCode": "0", "ResultDesc": "Success."})
+    resp = client.post("/api/mpesa/transactions/1/reconcile", headers=headers)
+
+    assert resp.status_code == 200
+    assert (
+        resp.get_json()["data"]["status"] == MpesaTransactionStatus.COMPLETED
+    )
+    assert _balance(app, user["id"]) == Decimal("510.00")
+
+    with app.app_context():
+        stored = MpesaTransaction.query.one()
+        assert stored.status == MpesaTransactionStatus.COMPLETED
+        assert Transaction.query.count() == 1
+        assert WalletLedger.query.count() == 1
+
+
+def test_missing_callback_recovered_by_user_reconcile(
+    client, app, authenticated_user, fake_daraja
+):
+    """Possibility F: the Daraja callback never reaches the backend.
+
+    The deposit sits in PENDING forever unless something reconciles it. The
+    user-scoped endpoint lets the frontend recover it without an admin, so a
+    genuine payment is never stranded.
+    """
+    user, headers = authenticated_user(email="depositor@example.com", balance="10.00")
+    _initiate_deposit(client, headers, fake_daraja)
+
+    # No callback is ever posted.
+    assert _balance(app, user["id"]) == Decimal("10.00")
+
+    fake_daraja(query_response={"ResultCode": "0", "ResultDesc": "Success."})
+    resp = client.post("/api/mpesa/transactions/1/reconcile", headers=headers)
+
+    assert resp.status_code == 200
+    assert (
+        resp.get_json()["data"]["status"] == MpesaTransactionStatus.COMPLETED
+    )
+    assert _balance(app, user["id"]) == Decimal("510.00")
+
+
+def test_user_reconcile_is_ownership_scoped(
+    client, app, authenticated_user, fake_daraja, create_user, login
+):
+    owner, owner_headers = authenticated_user(
+        email="owner@example.com", balance="10.00"
+    )
+    deposit = _initiate_deposit(client, owner_headers, fake_daraja)
+
+    other = create_user(email="other@example.com", balance="10.00")
+    other_headers = login(other["email"], other["password"])
+    fake_daraja(query_response={"ResultCode": "0", "ResultDesc": "Success."})
+
+    # Another user reconciling the owner's deposit must not see/change it.
+    resp = client.post(
+        f"/api/mpesa/transactions/{deposit['id']}/reconcile",
+        headers=other_headers,
+    )
+    assert resp.status_code == 404
+    # Owner's wallet is unaffected (no credit happened on their behalf).
+    assert _balance(app, owner["id"]) == Decimal("10.00")
+
+
+def test_user_reconcile_requires_authentication(client, fake_daraja):
+    fake_daraja()
+    resp = client.post("/api/mpesa/transactions/1/reconcile")
+    assert resp.status_code == 401
+
+
+def test_user_reconcile_unknown_transaction_returns_404(
+    client, authenticated_user, fake_daraja
+):
+    _, headers = authenticated_user(email="depositor@example.com")
+    fake_daraja()
+    resp = client.post("/api/mpesa/transactions/999999/reconcile", headers=headers)
+    assert resp.status_code == 404
+
+
+def test_user_reconcile_does_not_double_credit_completed_deposit(
+    client, app, authenticated_user, fake_daraja
+):
+    user, headers = authenticated_user(email="depositor@example.com", balance="10.00")
+    _initiate_deposit(client, headers, fake_daraja)
+    fake_daraja(query_response={"ResultCode": "0", "ResultDesc": "Success."})
+    client.post(CALLBACK_URL, json=_callback_payload())
+    assert _balance(app, user["id"]) == Decimal("510.00")
+
+    # Reconciling an already-completed deposit must be a safe no-op.
+    resp = client.post("/api/mpesa/transactions/1/reconcile", headers=headers)
+    assert resp.status_code == 200
+    assert (
+        resp.get_json()["data"]["status"] == MpesaTransactionStatus.COMPLETED
+    )
+    assert _balance(app, user["id"]) == Decimal("510.00")
+
+    with app.app_context():
+        assert Transaction.query.count() == 1
+        assert WalletLedger.query.count() == 1
+
+
+def test_reconciliation_sweeper_does_not_start_under_testing(app):
+    """Guard: the background sweep must never run (or spawn threads) in tests."""
+    assert getattr(app, "_mpesa_sweeper_started", False) is False
+
+
+def test_sweeper_helper_starts_thread_and_reconciles(
+    app, authenticated_user, fake_daraja, monkeypatch
+):
+    """Integration: the sweeper thread actually credits a stuck deposit.
+
+    Uses a non-testing app and a tiny interval, then stops the thread after the
+    assertion so it does not keep running for the rest of the suite.
+    """
+    # Build a non-testing config that still uses an isolated sqlite DB.
+    import tempfile
+
+    from app.config import TestConfig
+
+    class _SweeperConfig(TestConfig):
+        TESTING = False
+        SQLALCHEMY_DATABASE_URI = f"sqlite:///{tempfile.mkdtemp()}/sweep.db"
+        # Allow the background sweep thread to share the file-based SQLite
+        # connection (PostgreSQL/MySQL in production are unaffected).
+        SQLALCHEMY_ENGINE_OPTIONS = {
+            "connect_args": {"check_same_thread": False}
+        }
+
+    sweep_app = create_app(_SweeperConfig)
+    stop = threading.Event()
+
+    with sweep_app.app_context():
+        db.create_all()
+        user = User(
+            first_name="Sweep",
+            last_name="User",
+            email="sweep@example.com",
+            phone_number="254712345678",
+            role="user",
+            is_active=True,
+            status="Active",
+        )
+        user.set_password("SecurePass123")
+        db.session.add(user)
+        db.session.commit()
+        user_id = user.id
+        wallet = Wallet(user_id=user_id, balance=Decimal("10.00"))
+        db.session.add(wallet)
+        db.session.commit()
+        wallet_id = wallet.id
+
+        # A deposit stuck in PENDING because the callback never arrived.
+        mpesa_transaction = MpesaTransaction(
+            user_id=user_id,
+            wallet_id=wallet_id,
+            account_reference="REFNORENT",
+            phone_number="254712345678",
+            amount=Decimal("500.00"),
+            status=MpesaTransactionStatus.PENDING,
+            checkout_request_id="ws_CO_sweeper_test",
+        )
+        db.session.add(mpesa_transaction)
+        db.session.commit()
+
+    # Monkeypatch Daraja so the sweeper's recovery query confirms success.
+    fake_daraja(query_response={"ResultCode": "0", "ResultDesc": "Success."})
+
+    # Patch the running loop to honour a stop event so we don't leak a thread.
+    original_run = MpesaService.start_reconciliation_sweeper
+    started_threads = []
+
+    def _patched_start(app_obj, interval=None):
+        if app_obj.config.get("TESTING"):
+            return
+        iv = int(interval or app_obj.config.get("MPESA_RECONCILIATION_INTERVAL_SECONDS", 60))
+        if iv <= 0:
+            return
+        if getattr(app_obj, "_mpesa_sweeper_started", False):
+            return
+        app_obj._mpesa_sweeper_started = True
+
+        def _loop():
+            while not stop.is_set():
+                stop.wait(iv / 1000.0 if iv < 1 else 0.05)
+                if stop.is_set():
+                    return
+                try:
+                    with app_obj.app_context():
+                        MpesaService.recover_deposits()
+                except Exception:
+                    pass
+
+        t = threading.Thread(target=_loop, name="test-sweeper", daemon=True)
+        started_threads.append(t)
+        t.start()
+
+    monkeypatch.setattr(MpesaService, "start_reconciliation_sweeper", _patched_start)
+    # The real sweeper already ran during create_app and set this flag; clear it
+    # so our patched (stoppable) sweeper is actually allowed to start.
+    sweep_app._mpesa_sweeper_started = False
+    _patched_start(sweep_app, interval=1)
+
+    try:
+        # Give the sweeper a few ticks to reconcile the stuck deposit.
+        for _ in range(50):
+            with sweep_app.app_context():
+                if (
+                    MpesaTransaction.query.filter_by(
+                        checkout_request_id="ws_CO_sweeper_test"
+                    ).first().status
+                    == MpesaTransactionStatus.COMPLETED
+                ):
+                    break
+            time.sleep(0.05)
+    finally:
+        stop.set()
+
+    with sweep_app.app_context():
+        stored = MpesaTransaction.query.filter_by(
+            checkout_request_id="ws_CO_sweeper_test"
+        ).first()
+        assert stored.status == MpesaTransactionStatus.COMPLETED
+        assert Decimal(str(Wallet.query.get(wallet_id).balance)) == Decimal("510.00")
+        assert Transaction.query.count() == 1
+        assert WalletLedger.query.count() == 1
+
+    # Restore the real helper (no-op for other tests since they use TESTING).
+    monkeypatch.setattr(MpesaService, "start_reconciliation_sweeper", original_run)
+
+
+# --- Issue 5: post-review hardening tests ----------------------------------
+
+
+def test_repeated_reconciliation_attempts_credit_exactly_once(
+    app, create_user, fake_daraja
+):
+    """Running recover_deposits many times against a confirmed deposit
+    must credit exactly once. The ledger constraint is the backstop.
+    """
+    fake_daraja(query_response={"ResultCode": "0", "ResultDesc": "Success."})
+    user = create_user(email="repeat@example.com", balance="1000.00")
+    user_id = user["id"]
+    cid = "ws_CO_repeat"
+    _make_pending_deposit(app, user_id, cid)
+
+    # Many sweeps; Daraja keeps confirming success.
+    for _ in range(5):
+        MpesaService.recover_deposits()
+
+    with app.app_context():
+        wallet = Wallet.query.filter_by(user_id=user_id).first()
+        assert Decimal(str(wallet.balance)) == Decimal("1500.00")
+        assert Transaction.query.count() == 1
+        assert WalletLedger.query.count() == 1
+        stored = MpesaTransaction.query.filter_by(
+            checkout_request_id=cid
+        ).first()
+        assert stored.status == MpesaTransactionStatus.COMPLETED
+        assert stored.reconciliation_attempts >= 1
+
+
+def test_stuck_deposit_produces_visibility_log_but_not_failed(
+    app, create_user, caplog
+):
+    """A long-stuck deposit produces a structured warning but is NOT
+    automatically marked FAILED. Visibility only, never a state change.
+    """
+    user = create_user(email="stuck@example.com", balance="1000.00")
+    user_id = user["id"]
+    cid = "ws_CO_stuck"
+    with app.app_context():
+        wallet = Wallet.query.filter_by(user_id=user_id).first()
+        m = MpesaTransaction(
+            user_id=user_id,
+            wallet_id=wallet.id,
+            account_reference="REFSTUCK",
+            phone_number="254712345678",
+            amount=Decimal("500.00"),
+            status=MpesaTransactionStatus.PENDING,
+            merchant_request_id="x",
+            checkout_request_id=cid,
+            created_at=datetime.utcnow() - timedelta(days=3),
+        )
+        db.session.add(m)
+        db.session.commit()
+
+    # Lower the threshold so our 3-day-old deposit triggers the alert.
+    app.config["MPESA_STUCK_DEPOSIT_ALERT_SECONDS"] = 3600  # 1 hour
+
+    with caplog.at_level(logging.WARNING):
+        MpesaService._alert_stuck_deposits(app)
+
+    assert any(
+        "MPESA_EVENT=STUCK_DEPOSIT_ALERT" in r.message for r in caplog.records
+    )
+    with app.app_context():
+        stored = MpesaTransaction.query.filter_by(
+            checkout_request_id=cid
+        ).first()
+        assert stored.status == MpesaTransactionStatus.PENDING  # NOT failed
+        assert stored.failure_reason is None
+
+
+def test_stuck_deposit_by_reconciliation_attempts(app, create_user, caplog):
+    """A deposit that has been reconciled many times without resolution
+    triggers the attempts-based alert.
+    """
+    user = create_user(email="attempted@example.com", balance="1000.00")
+    user_id = user["id"]
+    cid = "ws_CO_attempts"
+    with app.app_context():
+        wallet = Wallet.query.filter_by(user_id=user_id).first()
+        m = MpesaTransaction(
+            user_id=user_id,
+            wallet_id=wallet.id,
+            account_reference="REFATTEMPT",
+            phone_number="254712345678",
+            amount=Decimal("500.00"),
+            status=MpesaTransactionStatus.RECONCILIATION_PENDING,
+            merchant_request_id="x",
+            checkout_request_id=cid,
+            reconciliation_attempts=50,
+        )
+        db.session.add(m)
+        db.session.commit()
+
+    app.config["MPESA_MAX_RECONCILIATION_ATTEMPTS"] = 48
+
+    with caplog.at_level(logging.WARNING):
+        MpesaService._alert_stuck_deposits(app)
+
+    assert any(
+        "MPESA_EVENT=STUCK_DEPOSIT_ALERT" in r.message for r in caplog.records
+    )
+    with app.app_context():
+        stored = MpesaTransaction.query.filter_by(
+            checkout_request_id=cid
+        ).first()
+        assert stored.status == MpesaTransactionStatus.RECONCILIATION_PENDING
+
+
+def test_non_stuck_deposit_does_not_alert(app, create_user, caplog):
+    """A fresh deposit should not trigger any stuck-deposit alert."""
+    user = create_user(email="fresh@example.com", balance="1000.00")
+    user_id = user["id"]
+    cid = "ws_CO_fresh"
+    with app.app_context():
+        wallet = Wallet.query.filter_by(user_id=user_id).first()
+        m = MpesaTransaction(
+            user_id=user_id,
+            wallet_id=wallet.id,
+            account_reference="REFFRESH",
+            phone_number="254712345678",
+            amount=Decimal("500.00"),
+            status=MpesaTransactionStatus.PENDING,
+            merchant_request_id="x",
+            checkout_request_id=cid,
+        )
+        db.session.add(m)
+        db.session.commit()
+
+    app.config["MPESA_STUCK_DEPOSIT_ALERT_SECONDS"] = 86400  # 1 day
+    app.config["MPESA_MAX_RECONCILIATION_ATTEMPTS"] = 48
+
+    with caplog.at_level(logging.WARNING):
+        MpesaService._alert_stuck_deposits(app)
+
+    assert not any(
+        "MPESA_EVENT=STUCK_DEPOSIT_ALERT" in r.message for r in caplog.records
+    )
+
+
+def test_sweeper_exception_does_not_terminate_loop(
+    app, authenticated_user, fake_daraja, monkeypatch, caplog
+):
+    """Exceptions in the reconciliation loop must not kill the sweeper.
+    The loop catches and logs, then continues to the next cycle.
+    """
+    import tempfile
+
+    from app.config import TestConfig
+    from app.models.user import User as UserModel
+
+    class _SweeperConfig(TestConfig):
+        TESTING = False
+        SQLALCHEMY_DATABASE_URI = f"sqlite:///{tempfile.mkdtemp()}/sweep_err.db"
+        SQLALCHEMY_ENGINE_OPTIONS = {
+            "connect_args": {"check_same_thread": False}
+        }
+
+    sweep_app = create_app(_SweeperConfig)
+    stop = threading.Event()
+
+    with sweep_app.app_context():
+        db.create_all()
+        user = UserModel(
+            first_name="Sweep",
+            last_name="Err",
+            email="sweepererr@example.com",
+            phone_number="254712345678",
+            role="user",
+            is_active=True,
+            status="Active",
+        )
+        user.set_password("SecurePass123")
+        db.session.add(user)
+        db.session.commit()
+        user_id = user.id
+        wallet = Wallet(user_id=user_id, balance=Decimal("10.00"))
+        db.session.add(wallet)
+        db.session.commit()
+        wallet_id = wallet.id
+        m = MpesaTransaction(
+            user_id=user_id,
+            wallet_id=wallet_id,
+            account_reference="REFERR",
+            phone_number="254712345678",
+            amount=Decimal("500.00"),
+            status=MpesaTransactionStatus.PENDING,
+            checkout_request_id="ws_CO_sweeper_err",
+        )
+        db.session.add(m)
+        db.session.commit()
+
+    fake_daraja(query_response={"ResultCode": "0", "ResultDesc": "Success."})
+
+    # Make recover_deposits fail twice, then succeed.
+    calls = {"n": 0}
+    orig_recover = MpesaService.recover_deposits
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise RuntimeError("simulated sweeper failure")
+        return orig_recover()
+
+    monkeypatch.setattr(MpesaService, "recover_deposits", flaky)
+    sweep_app._mpesa_sweeper_started = False
+
+    # Build a stoppable sweeper that uses _sweeper_cycle (which catches
+    # exceptions via the outer try/except in _run_sweeper).
+    def _patched_start(app_obj, interval=None):
+        if app_obj.config.get("TESTING"):
+            return
+        if getattr(app_obj, "_mpesa_sweeper_started", False):
+            return
+        app_obj._mpesa_sweeper_started = True
+
+        def _loop():
+            leader_state = {}
+            while not stop.is_set():
+                stop.wait(0.05)
+                if stop.is_set():
+                    return
+                try:
+                    with app_obj.app_context():
+                        MpesaService._sweeper_cycle(app_obj, leader_state)
+                except Exception:
+                    app_obj.logger.exception("MPESA_EVENT=SWEEPER_ERROR")
+
+        t = threading.Thread(target=_loop, name="test-sweeper-err", daemon=True)
+        t.start()
+
+    monkeypatch.setattr(
+        MpesaService, "start_reconciliation_sweeper", _patched_start
+    )
+    _patched_start(sweep_app, interval=1)
+
+    try:
+        for _ in range(60):
+            with sweep_app.app_context():
+                stored = MpesaTransaction.query.filter_by(
+                    checkout_request_id="ws_CO_sweeper_err"
+                ).first()
+                if stored.status == MpesaTransactionStatus.COMPLETED:
+                    break
+            time.sleep(0.05)
+    finally:
+        stop.set()
+
+    with sweep_app.app_context():
+        stored = MpesaTransaction.query.filter_by(
+            checkout_request_id="ws_CO_sweeper_err"
+        ).first()
+        assert stored.status == MpesaTransactionStatus.COMPLETED
+        assert (
+            Decimal(str(Wallet.query.get(wallet_id).balance)) == Decimal("510.00")
+        )
+
+
+def test_sweeper_logs_leadership_cycle_events(app, monkeypatch, caplog):
+    """On SQLite the sweeper logs SWEEPER_LEADERSHIP_UNSUPPORTED (no advisory
+    locks available), confirming the operator knows coordination is absent.
+    """
+    leader_state = {}
+    with caplog.at_level(logging.WARNING):
+        result = MpesaService._acquire_sweeper_leadership(app, leader_state)
+
+    # On SQLite, leadership is always granted (no PG advisory locks).
+    assert result is True
+    assert any(
+        "SWEEPER_LEADERSHIP_UNSUPPORTED" in r.message for r in caplog.records
+    )
+    assert leader_state.get("warned_non_pg") is True
+
+    # Second call should not re-warn (idempotent).
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        result2 = MpesaService._acquire_sweeper_leadership(app, leader_state)
+    assert result2 is True
+    assert not any(
+        "SWEEPER_LEADERSHIP_UNSUPPORTED" in r.message for r in caplog.records
+    )
+
+
+def test_sweeper_cycle_runs_on_sqlite(app, fake_daraja, caplog):
+    """On SQLite, _sweeper_cycle runs recover_deposits (leadership always
+    granted) and logs SWEEPER_CYCLE_STARTED + SWEEPER_SUMMARY.
+    """
+    fake_daraja(query_response={"ResultCode": "0", "ResultDesc": "Success."})
+    leader_state = {}
+
+    with caplog.at_level(logging.INFO):
+        MpesaService._sweeper_cycle(app, leader_state)
+
+    assert any("SWEEPER_CYCLE_STARTED" in r.message for r in caplog.records)
+    assert any("SWEEPER_SUMMARY" in r.message for r in caplog.records)
+
+    # Leadership should be released (no conn in state on SQLite).
+    assert leader_state.get("conn") is None
