@@ -77,6 +77,30 @@ def get_mpesa_transaction_status(transaction_id):
     )
 
 
+@mpesa_bp.post("/transactions/<int:transaction_id>/reconcile")
+@jwt_required_custom
+@handle_api_errors
+def reconcile_user_deposit(transaction_id):
+    """User-scoped nudge to recover the caller's own stuck deposit.
+
+    The backend automatically reconciles (see the background sweep started in
+    ``create_app``), but this lets the frontend actively trigger recovery of a
+    PENDING / RECONCILIATION_PENDING deposit without waiting for the next sweep
+    or an admin. Ownership-scoped: a user can only reconcile their own deposit,
+    identified by the internal primary-key id, never the Daraja
+    ``checkout_request_id``. The Daraja reconciliation that actually authorises a
+    credit still runs server-side, so this can never manufacture money.
+    """
+    current_user = get_current_user()
+
+    status = MpesaService.reconcile_user_deposit(current_user.id, transaction_id)
+
+    return success_response(
+        message="M-Pesa deposit reconciliation attempted.",
+        data={"status": status},
+    )
+
+
 @mpesa_bp.post("/callback")
 @handle_api_errors
 def mpesa_callback():

@@ -8,6 +8,8 @@ hardcoded, and are never logged or returned in an API response.
 """
 
 import base64
+import threading
+import time
 from datetime import datetime
 
 import requests
@@ -19,7 +21,12 @@ from app.models.mpesa_transaction import MpesaTransaction, MpesaTransactionStatu
 from app.services.transaction_service import TransactionService
 from app.services.wallet_service import WalletService
 from app.utils.errors import ApiError, ErrorCode
-from app.utils.helpers import generate_account_reference, to_money, truncate
+from app.utils.helpers import (
+    generate_account_reference,
+    mask_phone_number,
+    to_money,
+    truncate,
+)
 
 TOKEN_PATH = "/oauth/v1/generate?grant_type=client_credentials"
 STK_PUSH_PATH = "/mpesa/stkpush/v1/processrequest"
@@ -268,6 +275,16 @@ class MpesaService:
         )
         account_reference = generate_account_reference()
 
+        current_app.logger.info(
+            "MPESA_EVENT=STK_PUSH_REQUESTED user=%s wallet=%s amount=%s "
+            "account_reference=%s phone=%s",
+            user.id,
+            wallet.id,
+            amount,
+            account_reference,
+            mask_phone_number(phone),
+        )
+
         try:
             response = MpesaService.send_stk_push(
                 amount=amount,
@@ -275,6 +292,13 @@ class MpesaService:
                 account_reference=account_reference,
             )
         except ApiError as error:
+            current_app.logger.error(
+                "MPESA_EVENT=STK_PUSH_FAILED user=%s account_reference=%s "
+                "reason=%s",
+                user.id,
+                account_reference,
+                error.message,
+            )
             MpesaService._persist_failed_attempt(
                 user, wallet, account_reference, phone, amount, error.message
             )
@@ -287,6 +311,11 @@ class MpesaService:
                 response.get("errorMessage")
                 or response.get("ResponseDescription")
                 or "M-Pesa request was not accepted."
+            )
+            current_app.logger.error(
+                "MPESA_EVENT=STK_PUSH_REJECTED user=%s response_code=%s",
+                user.id,
+                response_code,
             )
             MpesaService._persist_failed_attempt(
                 user, wallet, account_reference, phone, amount, failure_reason
@@ -328,9 +357,20 @@ class MpesaService:
             )
 
         current_app.logger.info(
-            "STK push initiated: mpesa_transaction=%s checkout_request_id=%s",
+            "MPESA_EVENT=STK_PUSH_ACCEPTED user=%s mpesa_transaction=%s "
+            "checkout_request_id=%s merchant_request_id=%s",
+            user.id,
             mpesa_transaction.id,
             mpesa_transaction.checkout_request_id,
+            mpesa_transaction.merchant_request_id,
+        )
+        current_app.logger.info(
+            "MPESA_EVENT=MPESA_TRANSACTION_CREATED mpesa_transaction=%s "
+            "checkout_request_id=%s status=%s amount=%s",
+            mpesa_transaction.id,
+            mpesa_transaction.checkout_request_id,
+            mpesa_transaction.status,
+            mpesa_transaction.amount,
         )
 
         return mpesa_transaction
@@ -423,12 +463,14 @@ class MpesaService:
         """
         checkout_request_id = parsed_callback["checkout_request_id"]
 
+        # Phase 1 — locate the deposit with an ORDINARY read (no row lock). The
+        # untrusted callback is only a notification; we need its id to key the
+        # later authoritative Daraja reconciliation, but we must not hold a
+        # database lock while we perform the slow network round-trip.
         mpesa_transaction = (
             MpesaTransaction.query.filter_by(
                 checkout_request_id=checkout_request_id
-            )
-            .with_for_update()
-            .first()
+            ).first()
         )
 
         if not mpesa_transaction:
@@ -436,6 +478,42 @@ class MpesaService:
                 "Received M-Pesa callback for unknown checkout_request_id=%s",
                 checkout_request_id,
             )
+            return None
+
+        mpesa_transaction_id = mpesa_transaction.id
+
+        # Release the read-only transaction immediately so no lock or open
+        # snapshot is held across the outbound Daraja call below.
+        db.session.rollback()
+
+        current_app.logger.info(
+            "MPESA_EVENT=CALLBACK_RECEIVED mpesa_transaction=%s "
+            "checkout_request_id=%s merchant_request_id=%s callback_result_code=%s",
+            mpesa_transaction_id,
+            checkout_request_id,
+            parsed_callback.get("merchant_request_id"),
+            parsed_callback.get("result_code"),
+        )
+
+        # Phase 2 — reconcile with Daraja (authenticated server-to-server). NO
+        # database transaction or row lock is held during this network call.
+        try:
+            query_result = MpesaService.query_stk_status(checkout_request_id)
+        except ApiError:
+            # Could not reach Daraja: do NOT credit and do NOT mark the deposit
+            # failed. Acquire the row lock, re-read the latest state, and only
+            # then keep the deposit recoverable — a concurrent callback/sweeper
+            # may already have credited it.
+            return MpesaService._callback_keep_recoverable(
+                mpesa_transaction_id, parsed_callback, checkout_request_id
+            )
+
+        # Phase 3 — acquire the row lock and re-read the authoritative latest
+        # state. A concurrent callback/sweeper may have resolved this deposit
+        # while the Daraja query was in flight.
+        mpesa_transaction = MpesaService._lock_mpesa_transaction(mpesa_transaction_id)
+
+        if mpesa_transaction is None:
             db.session.rollback()
             return None
 
@@ -449,8 +527,9 @@ class MpesaService:
             db.session.rollback()
             return mpesa_transaction
 
-        # PENDING and RECONCILIATION_PENDING are reprocessed below. Record the
-        # callback envelope (attacker-controlled; never trusted for a credit).
+        # Record the callback envelope (attacker-controlled; never trusted for a
+        # credit) now that we hold the lock and have re-read the row, so a caller
+        # holding a stale copy cannot clobber another worker's writes.
         mpesa_transaction.result_code = truncate(parsed_callback["result_code"], 10)
         mpesa_transaction.result_desc = truncate(
             parsed_callback["result_desc"], RESULT_DESC_MAX_LENGTH
@@ -459,28 +538,16 @@ class MpesaService:
             parsed_callback["transaction_date"], 20
         )
 
-        # The callback's ResultCode is attacker-controlled and must not be
-        # trusted. Reconcile with Daraja (authenticated server-to-server) to
-        # learn the actual outcome.
-        try:
-            query_result = MpesaService.query_stk_status(checkout_request_id)
-        except ApiError:
-            # Could not reach Daraja: do NOT credit and do NOT mark the deposit
-            # failed. Keep it recoverable so a later callback or reconciliation
-            # can still resolve it.
-            mpesa_transaction.status = MpesaTransactionStatus.RECONCILIATION_PENDING
-            MpesaService._record_reconciliation_attempt(mpesa_transaction)
-            db.session.commit()
-            current_app.logger.error(
-                "M-Pesa reconciliation unreachable; keeping deposit recoverable: "
-                "mpesa_transaction=%s",
-                mpesa_transaction.id,
-            )
-            return mpesa_transaction
-
         query_code = str(query_result.get("ResultCode"))
 
         if query_code == "0":
+            current_app.logger.info(
+                "MPESA_EVENT=CALLBACK_SUCCESS mpesa_transaction=%s "
+                "checkout_request_id=%s query_result_code=%s",
+                mpesa_transaction.id,
+                checkout_request_id,
+                query_code,
+            )
             return MpesaService._credit_confirmed_deposit(
                 mpesa_transaction,
                 callback_amount=parsed_callback["amount"],
@@ -501,9 +568,11 @@ class MpesaService:
             )
             db.session.commit()
             current_app.logger.info(
-                "M-Pesa payment definitively failed: mpesa_transaction=%s code=%s",
+                "MPESA_EVENT=CALLBACK_FAILURE mpesa_transaction=%s code=%s "
+                "checkout_request_id=%s",
                 mpesa_transaction.id,
                 query_code,
+                checkout_request_id,
             )
             return mpesa_transaction
 
@@ -515,12 +584,52 @@ class MpesaService:
         )
         db.session.commit()
         current_app.logger.info(
-            "M-Pesa reconciliation inconclusive; deposit stays recoverable: "
-            "mpesa_transaction=%s code=%s",
+            "MPESA_EVENT=RECONCILIATION_RESULT mpesa_transaction=%s outcome="
+            "INCONCLUSIVE query_result_code=%s checkout_request_id=%s status=%s",
             mpesa_transaction.id,
             query_code,
+            checkout_request_id,
+            mpesa_transaction.status,
         )
         return mpesa_transaction
+
+    @staticmethod
+    def _callback_keep_recoverable(mpesa_transaction_id, parsed_callback, checkout_request_id):
+        """Daraja unreachable from the callback: keep the deposit recoverable.
+
+        Re-acquires the row lock, re-reads the latest state, and only then marks
+        the deposit ``RECONCILIATION_PENDING``. A concurrent callback/sweeper may
+        already have credited or failed the deposit, in which case we leave it
+        untouched rather than clobbering its terminal state.
+        """
+        locked = MpesaService._lock_mpesa_transaction(mpesa_transaction_id)
+
+        if locked is None:
+            db.session.rollback()
+            return None
+
+        if MpesaTransactionStatus.is_terminal(locked.status):
+            db.session.rollback()
+            return locked
+
+        # Record the callback envelope (attacker-controlled; never trusted) while
+        # we hold the lock, then keep the deposit recoverable for a later retry.
+        locked.result_code = truncate(parsed_callback["result_code"], 10)
+        locked.result_desc = truncate(
+            parsed_callback["result_desc"], RESULT_DESC_MAX_LENGTH
+        )
+        locked.transaction_date = truncate(
+            parsed_callback["transaction_date"], 20
+        )
+        locked.status = MpesaTransactionStatus.RECONCILIATION_PENDING
+        MpesaService._record_reconciliation_attempt(locked)
+        db.session.commit()
+        current_app.logger.error(
+            "M-Pesa reconciliation unreachable; keeping deposit recoverable: "
+            "mpesa_transaction=%s",
+            locked.id,
+        )
+        return locked
 
     @staticmethod
     def _credit_confirmed_deposit(mpesa_transaction, callback_amount, receipt_number):
@@ -625,6 +734,15 @@ class MpesaService:
                 description="M-Pesa deposit",
             )
 
+            current_app.logger.info(
+                "MPESA_EVENT=DEPOSIT_RECORDED mpesa_transaction=%s transaction=%s "
+                "amount=%s reference=%s",
+                mpesa_transaction.id,
+                transaction.id,
+                expected_amount,
+                reference,
+            )
+
             if receipt_number:
                 # Only ever set the receipt; never overwrite a stored one with
                 # ``None`` (the recovery path has no receipt to report).
@@ -635,12 +753,32 @@ class MpesaService:
 
             db.session.commit()
 
+            current_app.logger.info(
+                "MPESA_EVENT=WALLET_CREDITED mpesa_transaction=%s "
+                "checkout_request_id=%s user=%s wallet=%s amount=%s "
+                "transaction=%s",
+                mpesa_transaction.id,
+                checkout_request_id,
+                mpesa_transaction.user_id,
+                wallet.id,
+                expected_amount,
+                transaction.id,
+            )
+            current_app.logger.info(
+                "MPESA_EVENT=LEDGER_ENTRY_CREATED mpesa_transaction=%s "
+                "wallet=%s reference=%s",
+                mpesa_transaction.id,
+                wallet.id,
+                reference,
+            )
+
         except IntegrityError:
             # The database-level backstop fired: this payment is already
             # credited. Never retry the credit.
             db.session.rollback()
             current_app.logger.warning(
-                "Duplicate M-Pesa credit prevented for checkout_request_id=%s",
+                "MPESA_EVENT=DUPLICATE_CREDIT_PREVENTED "
+                "checkout_request_id=%s",
                 checkout_request_id,
             )
             return MpesaTransaction.query.filter_by(
@@ -659,12 +797,6 @@ class MpesaService:
                 500,
                 ErrorCode.MPESA_REQUEST_FAILED,
             )
-
-        current_app.logger.info(
-            "M-Pesa deposit completed: mpesa_transaction=%s transaction=%s",
-            mpesa_transaction.id,
-            mpesa_transaction.transaction_id,
-        )
 
         return mpesa_transaction
 
@@ -709,13 +841,19 @@ class MpesaService:
         if not checkout_request_id:
             # Nothing to reconcile against Daraja; leave it recoverable.
             current_app.logger.warning(
-                "M-Pesa deposit cannot be reconciled without a "
-                "checkout_request_id: mpesa_transaction=%s",
+                "MPESA_EVENT=RECONCILIATION_SKIPPED mpesa_transaction=%s "
+                "reason=missing_checkout_request_id",
                 mpesa_transaction_id,
             )
             return "reconciliation_pending"
 
         # No database lock and no open transaction is held for this call.
+        current_app.logger.info(
+            "MPESA_EVENT=RECONCILIATION_STARTED mpesa_transaction=%s "
+            "checkout_request_id=%s",
+            mpesa_transaction_id,
+            checkout_request_id,
+        )
         try:
             query_result = MpesaService.query_stk_status(checkout_request_id)
         except ApiError:
@@ -728,7 +866,8 @@ class MpesaService:
         if mpesa_transaction is None:
             db.session.rollback()
             current_app.logger.warning(
-                "M-Pesa deposit disappeared during recovery: mpesa_transaction=%s",
+                "MPESA_EVENT=RECONCILIATION_ERROR mpesa_transaction=%s "
+                "reason=disappeared",
                 mpesa_transaction_id,
             )
             return "errors"
@@ -738,8 +877,8 @@ class MpesaService:
         if MpesaTransactionStatus.is_terminal(mpesa_transaction.status):
             db.session.rollback()
             current_app.logger.info(
-                "Skipping M-Pesa deposit resolved concurrently: "
-                "mpesa_transaction=%s status=%s",
+                "MPESA_EVENT=RECONCILIATION_SKIPPED mpesa_transaction=%s "
+                "reason=already_terminal status=%s",
                 mpesa_transaction.id,
                 mpesa_transaction.status,
             )
@@ -750,6 +889,12 @@ class MpesaService:
             mpesa_transaction.status = MpesaTransactionStatus.RECONCILIATION_PENDING
             MpesaService._record_reconciliation_attempt(mpesa_transaction)
             db.session.commit()
+            current_app.logger.error(
+                "MPESA_EVENT=RECONCILIATION_RESULT mpesa_transaction=%s "
+                "outcome=UNREACHABLE checkout_request_id=%s",
+                mpesa_transaction.id,
+                checkout_request_id,
+            )
             return "reconciliation_pending"
 
         query_code = str(query_result.get("ResultCode"))
@@ -770,10 +915,22 @@ class MpesaService:
                 credited is not None
                 and credited.status == MpesaTransactionStatus.COMPLETED
             ):
+                current_app.logger.info(
+                    "MPESA_EVENT=RECONCILIATION_RESULT mpesa_transaction=%s "
+                    "outcome=CREDITED checkout_request_id=%s",
+                    mpesa_transaction.id,
+                    checkout_request_id,
+                )
                 return "credited"
 
             # The credit was refused or rolled back (for example the database
             # backstop fired); report it rather than counting a phantom credit.
+            current_app.logger.error(
+                "MPESA_EVENT=RECONCILIATION_RESULT mpesa_transaction=%s "
+                "outcome=CREDIT_ERROR checkout_request_id=%s",
+                mpesa_transaction.id,
+                checkout_request_id,
+            )
             return "errors"
 
         if query_code in DEFINITIVE_FAILURE_RESULT_CODES:
@@ -786,8 +943,10 @@ class MpesaService:
             )
             db.session.commit()
             current_app.logger.info(
-                "M-Pesa payment definitively failed: mpesa_transaction=%s code=%s",
+                "MPESA_EVENT=RECONCILIATION_RESULT mpesa_transaction=%s "
+                "outcome=FAILED checkout_request_id=%s code=%s",
                 mpesa_transaction.id,
+                checkout_request_id,
                 query_code,
             )
             return "failed"
@@ -797,9 +956,10 @@ class MpesaService:
         MpesaService._record_reconciliation_attempt(mpesa_transaction, query_result)
         db.session.commit()
         current_app.logger.info(
-            "M-Pesa reconciliation inconclusive; deposit stays recoverable: "
-            "mpesa_transaction=%s code=%s",
+            "MPESA_EVENT=RECONCILIATION_RESULT mpesa_transaction=%s "
+            "outcome=INCONCLUSIVE checkout_request_id=%s code=%s",
             mpesa_transaction.id,
+            checkout_request_id,
             query_code,
         )
         return "reconciliation_pending"
@@ -861,3 +1021,306 @@ class MpesaService:
     def reconcile_pending():
         """Backwards-compatible alias for :meth:`recover_deposits`."""
         return MpesaService.recover_deposits()
+
+    @staticmethod
+    def reconcile_user_deposit(user_id, transaction_id):
+        """User-scoped reconciliation for a single deposit.
+
+        Ownership-checked wrapper around :meth:`_recover_one` so the frontend
+        can nudge recovery of the caller's own stuck deposit (for example when a
+        callback never arrived, or arrived while Daraja's live query was still
+        inconclusive) without waiting for the background sweep or an admin.
+
+        Returns the resulting transaction status string. Never credits a wallet
+        that is not the caller's, and raises ``404`` when the deposit does not
+        belong to the user so its existence is not leaked. The operation is
+        idempotent and safe to call repeatedly: a terminal deposit is skipped and
+        a confirmed-but-already-credited one is blocked by the ledger constraint.
+        """
+        mpesa_transaction = MpesaTransaction.query.filter_by(
+            id=transaction_id, user_id=user_id
+        ).first()
+
+        if not mpesa_transaction:
+            raise ApiError(
+                "M-Pesa transaction not found.",
+                404,
+                ErrorCode.TRANSACTION_NOT_FOUND,
+            )
+
+        checkout_request_id = mpesa_transaction.checkout_request_id
+
+        if not checkout_request_id:
+            # No Daraja reference to reconcile against; only a later callback or
+            # an admin action can resolve it. Leave the current status untouched.
+            current_app.logger.info(
+                "MPESA_EVENT=USER_RECONCILE_SKIPPED mpesa_transaction=%s "
+                "reason=missing_checkout_request_id",
+                mpesa_transaction.id,
+            )
+            return mpesa_transaction.status
+
+        current_app.logger.info(
+            "MPESA_EVENT=USER_RECONCILE_STARTED mpesa_transaction=%s "
+            "checkout_request_id=%s",
+            mpesa_transaction.id,
+            checkout_request_id,
+        )
+
+        outcome = MpesaService._recover_one(
+            mpesa_transaction.id, checkout_request_id
+        )
+
+        current_app.logger.info(
+            "MPESA_EVENT=USER_RECONCILE_RESULT mpesa_transaction=%s outcome=%s",
+            mpesa_transaction.id,
+            outcome,
+        )
+
+        refreshed = MpesaTransaction.query.filter_by(
+            id=mpesa_transaction.id
+        ).first()
+
+        return refreshed.status if refreshed else mpesa_transaction.status
+
+    # --- sweeper leadership (cross-process coordination) -------------------
+
+    # Stable, application-specific advisory-lock key so exactly one process per
+    # database becomes the reconciliation leader. Distinct from any other
+    # advisory lock the application might use.
+    DEFAULT_SWEEPER_LEADER_LOCK_ID = 912374561
+
+    @staticmethod
+    def _sweeper_leader_lock_id(app):
+        try:
+            return int(
+                app.config.get(
+                    "MPESA_SWEEPER_LEADER_LOCK_ID",
+                    MpesaService.DEFAULT_SWEEPER_LEADER_LOCK_ID,
+                )
+            )
+        except (TypeError, ValueError):
+            return MpesaService.DEFAULT_SWEEPER_LEADER_LOCK_ID
+
+    @staticmethod
+    def _acquire_sweeper_leadership(app, leader_state):
+        """Return ``True`` if this process may run the sweep this cycle.
+
+        On PostgreSQL a session-level advisory lock guarantees that, across all
+        application processes/workers/instances sharing the database, exactly one
+        becomes the reconciliation leader and the rest skip their sweeper cycles
+        instead of duplicating Daraja calls and database contention. The lock is
+        acquired for the duration of a single cycle and released afterwards, so a
+        leader that dies (its connection is closed by the server) automatically
+        releases the lock and another process takes over on its next cycle.
+
+        On non-PostgreSQL backends (e.g. SQLite in development) advisory locks
+        are unavailable, so cross-process coordination is impossible. We run the
+        sweeper directly and warn loudly: this is only safe for a single process
+        and MUST NOT be assumed safe for multi-instance production. No fake
+        locking is performed.
+        """
+        dialect = db.engine.dialect.name
+        if dialect != "postgresql":
+            if not leader_state.get("warned_non_pg"):
+                app.logger.warning(
+                    "MPESA_EVENT=SWEEPER_LEADERSHIP_UNSUPPORTED dialect=%s "
+                    "reason=advisory_locks_unavailable "
+                    "multiple_instances_would_duplicate_sweeps",
+                    dialect,
+                )
+                leader_state["warned_non_pg"] = True
+            return True
+
+        try:
+            conn = db.engine.connect()
+            acquired = conn.exec_driver_sql(
+                "SELECT pg_try_advisory_lock(:key)",
+                {"key": MpesaService._sweeper_leader_lock_id(app)},
+            ).scalar()
+        except Exception:
+            app.logger.exception("MPESA_EVENT=SWEEPER_LEADERSHIP_ERROR")
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return False
+
+        if not acquired:
+            conn.close()
+            if not leader_state.get("logged_not_leader"):
+                app.logger.info(
+                    "MPESA_EVENT=SWEEPER_NOT_LEADER lock_id=%s "
+                    "reason=another_process_holds_leadership",
+                    MpesaService._sweeper_leader_lock_id(app),
+                )
+                leader_state["logged_not_leader"] = True
+            return False
+
+        leader_state["conn"] = conn
+        leader_state["logged_not_leader"] = False
+        app.logger.info(
+            "MPESA_EVENT=SWEEPER_LEADER_ACQUIRED lock_id=%s",
+            MpesaService._sweeper_leader_lock_id(app),
+        )
+        return True
+
+    @staticmethod
+    def _release_sweeper_leadership(app, leader_state):
+        """Release the per-cycle advisory leadership lock, if held."""
+        conn = leader_state.pop("conn", None)
+        if conn is None:
+            return
+        try:
+            conn.exec_driver_sql(
+                "SELECT pg_advisory_unlock(:key)",
+                {"key": MpesaService._sweeper_leader_lock_id(app)},
+            )
+        except Exception:
+            app.logger.exception("MPESA_EVENT=SWEEPER_LEADERSHIP_RELEASE_ERROR")
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _alert_stuck_deposits(app):
+        """Surface long-stuck recoverable deposits for operator attention.
+
+        A deposit must never silently remain ``PENDING`` /
+        ``RECONCILIATION_PENDING`` for days. This does NOT change the deposit's
+        state or mark it ``FAILED`` — it only emits a structured warning carrying
+        the transaction id and recovery metadata so a human can investigate. The
+        thresholds are configurable via ``MPESA_STUCK_DEPOSIT_ALERT_SECONDS`` and
+        ``MPESA_MAX_RECONCILIATION_ATTEMPTS``.
+        """
+        threshold = app.config.get("MPESA_STUCK_DEPOSIT_ALERT_SECONDS")
+        max_attempts = app.config.get("MPESA_MAX_RECONCILIATION_ATTEMPTS")
+        if threshold is None and max_attempts is None:
+            return
+
+        now = datetime.utcnow()
+        rows = (
+            MpesaTransaction.query.filter(
+                MpesaTransaction.status.in_(
+                    MpesaTransactionStatus.RECOVERABLE_STATUSES
+                )
+            ).all()
+        )
+
+        for row in rows:
+            age = (
+                (now - row.created_at).total_seconds()
+                if row.created_at is not None
+                else None
+            )
+            stuck_age = (
+                age is not None
+                and threshold is not None
+                and age > threshold
+            )
+            stuck_attempts = (
+                max_attempts is not None
+                and (row.reconciliation_attempts or 0) >= max_attempts
+            )
+            if stuck_age or stuck_attempts:
+                app.logger.warning(
+                    "MPESA_EVENT=STUCK_DEPOSIT_ALERT mpesa_transaction=%s "
+                    "status=%s age_seconds=%s reconciliation_attempts=%s "
+                    "last_reconciled_at=%s action=manual_review_required",
+                    row.id,
+                    row.status,
+                    int(age) if age is not None else None,
+                    row.reconciliation_attempts or 0,
+                    row.last_reconciled_at.isoformat()
+                    if row.last_reconciled_at is not None
+                    else None,
+                )
+
+    @staticmethod
+    def start_reconciliation_sweeper(app, interval=None):
+        """Start a background sweep that recovers stuck M-Pesa deposits.
+
+        This closes the gap that caused the intermittent "paid but not credited"
+        bug: a deposit left in ``PENDING`` (callback never reached the backend)
+        or ``RECONCILIATION_PENDING`` (callback arrived while Daraja's live
+        query was still inconclusive) was previously only resolved by a manual
+        admin ``/admin/reconcile``. The sweeper periodically runs
+        :meth:`recover_deposits`, so a genuine payment is always credited
+        eventually, even if no callback and no frontend poll ever happens.
+
+        Design notes / safety:
+        * Not started when ``TESTING`` is set, so the test suite never performs
+          real Daraja calls or spawns threads.
+        * Runs in a daemon thread; one sweeper thread per process (guarded by a
+          flag on the app object) so Flask's reloader does not multiply it.
+        * Cross-process de-duplication is handled by PostgreSQL advisory-lock
+          leader election (see :meth:`_acquire_sweeper_leadership`): even with
+          multiple Gunicorn workers or multiple deployed instances, only one
+          process runs the actual reconciliation cycles. On non-PostgreSQL
+          backends the sweeper still runs but cannot coordinate, which is only
+          safe for a single process.
+        * The loop is observable (``SWEEPER_*`` events) and self-healing: any
+          exception in a cycle is logged via ``SWEEPER_ERROR`` and the loop
+          continues, so a single bad deposit or transient error can never stop
+          recovery for the others.
+        """
+        if app.config.get("TESTING"):
+            return
+
+        try:
+            interval = int(
+                interval
+                or app.config.get("MPESA_RECONCILIATION_INTERVAL_SECONDS", 60)
+            )
+        except (TypeError, ValueError):
+            interval = 60
+
+        if interval <= 0:
+            return
+
+        if getattr(app, "_mpesa_sweeper_started", False):
+            return
+
+        app._mpesa_sweeper_started = True
+
+        def _run_sweeper():
+            leader_state = {}
+            try:
+                while True:
+                    time.sleep(interval)
+                    try:
+                        with app.app_context():
+                            MpesaService._sweeper_cycle(app, leader_state)
+                    except Exception:
+                        # A cycle must never terminate the sweeper loop.
+                        app.logger.exception("MPESA_EVENT=SWEEPER_ERROR")
+            finally:
+                # Release any held leadership lock on thread/process shutdown.
+                MpesaService._release_sweeper_leadership(app, leader_state)
+
+        sweeper_thread = threading.Thread(
+            target=_run_sweeper,
+            name="mpesa-reconciliation-sweeper",
+            daemon=True,
+        )
+        sweeper_thread.start()
+        app.logger.info(
+            "MPESA_EVENT=SWEEPER_STARTED interval_seconds=%s", interval
+        )
+
+    @staticmethod
+    def _sweeper_cycle(app, leader_state):
+        """Run one reconciliation cycle if this process is the leader."""
+        if not MpesaService._acquire_sweeper_leadership(app, leader_state):
+            # Not the leader: do not duplicate Daraja calls or DB contention.
+            return
+
+        try:
+            app.logger.info("MPESA_EVENT=SWEEPER_CYCLE_STARTED")
+            summary = MpesaService.recover_deposits()
+            MpesaService._alert_stuck_deposits(app)
+            app.logger.info("MPESA_EVENT=SWEEPER_SUMMARY %s", summary)
+        finally:
+            MpesaService._release_sweeper_leadership(app, leader_state)

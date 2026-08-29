@@ -51,6 +51,37 @@ class Config:
     # Safe integer parsing: a malformed value must never crash Gunicorn boot.
     DARAJA_TIMEOUT = _parse_int_env('DARAJA_TIMEOUT', 30)
 
+    # Background reconciliation sweep: how often (seconds) the worker auto-runs
+    # recover_deposits() to credit deposits left in PENDING / RECONCILIATION_PENDING
+    # (callback never arrived, or arrived while Daraja's live query was still
+    # inconclusive). 0 disables the sweeper. Not started under TESTING.
+    MPESA_RECONCILIATION_INTERVAL_SECONDS = _parse_int_env(
+        'MPESA_RECONCILIATION_INTERVAL_SECONDS', 60
+    )
+
+    # Cross-process sweeper de-duplication (Issue 2). When the deployment runs
+    # multiple Gunicorn workers or multiple application instances, a PostgreSQL
+    # session-level advisory lock with this key ensures only ONE process runs the
+    # reconciliation sweep. Ignored on non-PostgreSQL backends (where advisory
+    # locks do not exist); there the sweeper runs unconditionally and a warning
+    # is logged. Keep this value distinct from any other advisory lock key.
+    MPESA_SWEEPER_LEADER_LOCK_ID = _parse_int_env(
+        'MPESA_SWEEPER_LEADER_LOCK_ID', 912374561
+    )
+
+    # Long-stuck deposit visibility (Issue 4). A deposit must never silently
+    # remain PENDING / RECONCILIATION_PENDING for days. When a recoverable
+    # deposit is older than this many seconds (or has been reconciled at least
+    # this many times) without resolving, the sweeper emits a structured warning
+    # carrying the transaction id and recovery metadata. This is visibility only;
+    # the deposit is NEVER automatically marked FAILED.
+    MPESA_STUCK_DEPOSIT_ALERT_SECONDS = _parse_int_env(
+        'MPESA_STUCK_DEPOSIT_ALERT_SECONDS', 86400
+    )
+    MPESA_MAX_RECONCILIATION_ATTEMPTS = _parse_int_env(
+        'MPESA_MAX_RECONCILIATION_ATTEMPTS', 48
+    )
+
     # Optional defence-in-depth: only accept M-Pesa callbacks from these source
     # IPs (comma-separated). Empty/unset means "allow all" — the authoritative
     # protection is Daraja reconciliation (see mpesa_service.query_stk_status),
