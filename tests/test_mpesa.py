@@ -13,7 +13,8 @@ from decimal import Decimal
 
 import pytest
 import requests
-from sqlalchemy import event
+from sqlalchemy import create_engine, event, text
+from sqlalchemy.dialects import postgresql
 
 from app import create_app
 from app.extensions import db
@@ -52,6 +53,14 @@ requires_postgres = pytest.mark.skipif(
     reason=(
         "row locking is a no-op on SQLite; set TEST_DATABASE_URL to a "
         "non-production PostgreSQL database to run this concurrency regression"
+    ),
+)
+
+requires_sqlite = pytest.mark.skipif(
+    _POSTGRES_TEST_DB,
+    reason=(
+        "asserts the non-PostgreSQL (no advisory locks) leadership fallback; "
+        "the PostgreSQL behaviour is covered by the requires_postgres tests"
     ),
 )
 
@@ -1987,6 +1996,7 @@ def test_sweeper_exception_does_not_terminate_loop(
         )
 
 
+@requires_sqlite
 def test_sweeper_logs_leadership_cycle_events(app, monkeypatch, caplog):
     """On SQLite the sweeper logs SWEEPER_LEADERSHIP_UNSUPPORTED (no advisory
     locks available), confirming the operator knows coordination is absent.
@@ -2012,6 +2022,7 @@ def test_sweeper_logs_leadership_cycle_events(app, monkeypatch, caplog):
     )
 
 
+@requires_sqlite
 def test_sweeper_cycle_runs_on_sqlite(app, fake_daraja, caplog):
     """On SQLite, _sweeper_cycle runs recover_deposits (leadership always
     granted) and logs SWEEPER_CYCLE_STARTED + SWEEPER_SUMMARY.
@@ -2027,3 +2038,407 @@ def test_sweeper_cycle_runs_on_sqlite(app, fake_daraja, caplog):
 
     # Leadership should be released (no conn in state on SQLite).
     assert leader_state.get("conn") is None
+
+
+# ---------------------------------------------------------------------------
+# Sweeper leadership: advisory-lock SQL execution path
+#
+# Regression cover for the production failure
+#   MPESA_EVENT=SWEEPER_LEADERSHIP_ERROR
+#   psycopg2.errors.SyntaxError: syntax error at or near ":"
+#   LINE 1: SELECT pg_try_advisory_lock(:key)
+# caused by running a SQLAlchemy-style named bind through
+# ``Connection.exec_driver_sql()``, which passes the string straight to the
+# DBAPI without compiling the bind into psycopg2's paramstyle.
+# ---------------------------------------------------------------------------
+
+
+class _FakeAdvisoryLockResult:
+    def __init__(self, value):
+        self._value = value
+
+    def scalar(self):
+        return self._value
+
+
+class _FakeLeadershipConnection:
+    """Stand-in for a psycopg2-backed connection.
+
+    ``execute()`` compiles the statement with the real PostgreSQL/psycopg2
+    dialect, so a statement that still carries an untranslated ``:key`` bind
+    (or a backslash-escaped ``\\:key``) fails here instead of in production.
+
+    ``exec_driver_sql()`` is a hard failure: it bypasses SQLAlchemy's bind
+    compilation, which is exactly what sent the literal text
+    ``pg_try_advisory_lock(:key)`` to PostgreSQL.
+    """
+
+    def __init__(self, acquired=True, raises=None):
+        self.acquired = acquired
+        self.raises = raises
+        self.statements = []
+        self.options = {}
+        self.closed = False
+
+    def execution_options(self, **options):
+        self.options.update(options)
+        return self
+
+    def execute(self, statement, parameters=None):
+        if self.raises is not None:
+            raise self.raises
+
+        compiled = str(statement.compile(dialect=postgresql.dialect()))
+
+        # The bind must be compiled into the driver paramstyle, never left as
+        # SQL text that PostgreSQL would have to parse.
+        assert ":key" not in compiled, compiled
+        assert "\\" not in compiled, compiled
+        assert "%(key)s" in compiled, compiled
+        assert isinstance(parameters, dict), parameters
+        assert isinstance(parameters.get("key"), int), parameters
+
+        self.statements.append((compiled, dict(parameters)))
+
+        if "pg_try_advisory_lock" in compiled:
+            return _FakeAdvisoryLockResult(self.acquired)
+
+        return _FakeAdvisoryLockResult(True)
+
+    def exec_driver_sql(self, statement, parameters=None):
+        raise AssertionError(
+            "advisory locks must not use exec_driver_sql(): it bypasses "
+            "SQLAlchemy bind compilation and sends ':key' to PostgreSQL "
+            f"literally (statement={statement!r})"
+        )
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.fixture
+def fake_pg_leadership(app):
+    """Force the PostgreSQL leadership branch onto a fake connection.
+
+    Lets the psycopg2 execution path be asserted on any backend (the suite
+    defaults to SQLite, which has no advisory locks). The engine is restored
+    before the ``app`` fixture tears the database down.
+    """
+    restore = []
+
+    def _install(connection=None, connect_error=None):
+        with app.app_context():
+            engine = db.engine
+
+        original_connect = engine.connect
+        original_dialect_name = engine.dialect.name
+        restore.append((engine, original_connect, original_dialect_name))
+
+        engine.dialect.name = "postgresql"
+
+        if connect_error is not None:
+            def _connect():
+                raise connect_error
+        else:
+            def _connect():
+                return connection
+
+        engine.connect = _connect
+
+        return connection
+
+    yield _install
+
+    for engine, original_connect, original_dialect_name in reversed(restore):
+        engine.connect = original_connect
+        engine.dialect.name = original_dialect_name
+
+
+def test_advisory_lock_statements_compile_to_bound_parameters():
+    """The lock SQL must compile to the driver paramstyle, not raw ``:key``."""
+    for statement in (
+        MpesaService._ACQUIRE_SWEEPER_LOCK_SQL,
+        MpesaService._RELEASE_SWEEPER_LOCK_SQL,
+    ):
+        compiled = str(statement.compile(dialect=postgresql.dialect()))
+
+        assert "%(key)s" in compiled, compiled
+        assert ":key" not in compiled, compiled
+        assert "\\" not in compiled, compiled
+        # Explicit cast pins pg_*_advisory_lock(bigint) resolution.
+        assert "bigint" in compiled.lower(), compiled
+
+
+def test_acquire_sweeper_leadership_executes_bound_sql_on_postgres(
+    app, fake_pg_leadership, caplog
+):
+    """Leadership is acquired via execute(text(...)) with a bound lock id."""
+    conn = _FakeLeadershipConnection(acquired=True)
+    fake_pg_leadership(connection=conn)
+    leader_state = {}
+
+    with app.app_context():
+        with caplog.at_level(logging.INFO):
+            acquired = MpesaService._acquire_sweeper_leadership(app, leader_state)
+
+    assert acquired is True
+    assert not any("SWEEPER_LEADERSHIP_ERROR" in r.message for r in caplog.records)
+    assert any("SWEEPER_LEADER_ACQUIRED" in r.message for r in caplog.records)
+
+    # Exactly one statement, carrying the configured lock id as a parameter.
+    assert len(conn.statements) == 1
+    compiled, params = conn.statements[0]
+    assert "pg_try_advisory_lock" in compiled
+    with app.app_context():
+        assert params == {"key": MpesaService._sweeper_leader_lock_id(app)}
+
+    # The connection is retained for the cycle and left usable.
+    assert leader_state["conn"] is conn
+    assert conn.closed is False
+    # Session-level advisory locks do not need a transaction held open.
+    assert conn.options.get("isolation_level") == "AUTOCOMMIT"
+
+
+def test_second_process_does_not_acquire_leadership_on_postgres(
+    app, fake_pg_leadership, caplog
+):
+    """pg_try_advisory_lock returning false means "not leader", not an error."""
+    conn = _FakeLeadershipConnection(acquired=False)
+    fake_pg_leadership(connection=conn)
+    leader_state = {}
+
+    with app.app_context():
+        with caplog.at_level(logging.INFO):
+            acquired = MpesaService._acquire_sweeper_leadership(app, leader_state)
+
+    assert acquired is False
+    assert any("SWEEPER_NOT_LEADER" in r.message for r in caplog.records)
+    assert not any("SWEEPER_LEADERSHIP_ERROR" in r.message for r in caplog.records)
+    assert leader_state.get("conn") is None
+    # The losing process must not hold a connection open.
+    assert conn.closed is True
+
+
+def test_release_sweeper_leadership_unlocks_with_bound_sql(app, fake_pg_leadership):
+    """Release runs pg_advisory_unlock with a bound id and closes the conn."""
+    conn = _FakeLeadershipConnection(acquired=True)
+    fake_pg_leadership(connection=conn)
+    leader_state = {}
+
+    with app.app_context():
+        assert MpesaService._acquire_sweeper_leadership(app, leader_state) is True
+        MpesaService._release_sweeper_leadership(app, leader_state)
+
+        assert len(conn.statements) == 2
+        compiled, params = conn.statements[1]
+        assert "pg_advisory_unlock" in compiled
+        assert params == {"key": MpesaService._sweeper_leader_lock_id(app)}
+
+    assert conn.closed is True
+    assert leader_state.get("conn") is None
+
+
+def test_leadership_error_is_logged_and_connection_closed(
+    app, fake_pg_leadership, caplog
+):
+    """A failing lock statement degrades to "not leader", never a crash."""
+    conn = _FakeLeadershipConnection(raises=RuntimeError("boom"))
+    fake_pg_leadership(connection=conn)
+    leader_state = {}
+
+    with app.app_context():
+        with caplog.at_level(logging.ERROR):
+            acquired = MpesaService._acquire_sweeper_leadership(app, leader_state)
+
+    assert acquired is False
+    assert any("SWEEPER_LEADERSHIP_ERROR" in r.message for r in caplog.records)
+    assert conn.closed is True
+    assert leader_state.get("conn") is None
+
+
+def test_leadership_connect_failure_does_not_raise(app, fake_pg_leadership, caplog):
+    """A failure before the connection exists must not raise NameError."""
+    fake_pg_leadership(connect_error=RuntimeError("pool exhausted"))
+    leader_state = {}
+
+    with app.app_context():
+        with caplog.at_level(logging.ERROR):
+            acquired = MpesaService._acquire_sweeper_leadership(app, leader_state)
+
+    assert acquired is False
+    assert any("SWEEPER_LEADERSHIP_ERROR" in r.message for r in caplog.records)
+    assert leader_state.get("conn") is None
+
+
+def test_sweeper_cycle_on_postgres_runs_without_leadership_error(
+    app, fake_pg_leadership, monkeypatch, caplog
+):
+    """A full cycle acquires, sweeps and releases with no LEADERSHIP_ERROR.
+
+    ``recover_deposits`` is stubbed out because the fake engine connection
+    stands in for the whole engine; the real database sweep is covered by the
+    SQLite/PostgreSQL cycle tests.
+    """
+    conn = _FakeLeadershipConnection(acquired=True)
+    fake_pg_leadership(connection=conn)
+    monkeypatch.setattr(
+        MpesaService, "recover_deposits", staticmethod(lambda: {"checked": 0})
+    )
+    monkeypatch.setattr(
+        MpesaService, "_alert_stuck_deposits", staticmethod(lambda app: None)
+    )
+    leader_state = {}
+
+    with app.app_context():
+        with caplog.at_level(logging.INFO):
+            MpesaService._sweeper_cycle(app, leader_state)
+
+    assert not any("SWEEPER_LEADERSHIP_ERROR" in r.message for r in caplog.records)
+    assert any("SWEEPER_LEADER_ACQUIRED" in r.message for r in caplog.records)
+    assert any("SWEEPER_CYCLE_STARTED" in r.message for r in caplog.records)
+    assert any("SWEEPER_SUMMARY" in r.message for r in caplog.records)
+
+    # Acquire + release, both as compiled/bound statements.
+    assert [s[0].split("(")[0] for s in conn.statements] == [
+        "SELECT pg_try_advisory_lock",
+        "SELECT pg_advisory_unlock",
+    ]
+    assert conn.closed is True
+    assert leader_state.get("conn") is None
+
+
+@requires_postgres
+def test_advisory_lock_round_trip_against_real_postgres(app, caplog):
+    """End-to-end against PostgreSQL: acquire, exclude, release, re-acquire."""
+    with app.app_context():
+        lock_id = MpesaService._sweeper_leader_lock_id(app)
+        database_url = db.engine.url
+
+        leader_state = {}
+        with caplog.at_level(logging.INFO):
+            acquired = MpesaService._acquire_sweeper_leadership(app, leader_state)
+
+        assert acquired is True
+        assert not any(
+            "SWEEPER_LEADERSHIP_ERROR" in r.message for r in caplog.records
+        )
+        assert leader_state.get("conn") is not None
+
+        # A separate engine == a separate PostgreSQL session, i.e. what another
+        # Render instance/worker process is: it must NOT get the lock.
+        other_engine = create_engine(database_url)
+        try:
+            with other_engine.connect() as other_conn:
+                held_by_other = other_conn.execute(
+                    text("SELECT pg_try_advisory_lock(CAST(:key AS bigint))"),
+                    {"key": lock_id},
+                ).scalar()
+            assert held_by_other is False
+        finally:
+            other_engine.dispose()
+
+        # The same is true through the service helper (second leader_state).
+        follower_state = {}
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            assert (
+                MpesaService._acquire_sweeper_leadership(app, follower_state) is False
+            )
+        assert any("SWEEPER_NOT_LEADER" in r.message for r in caplog.records)
+        assert follower_state.get("conn") is None
+
+        # Releasing frees the lock for the next process.
+        MpesaService._release_sweeper_leadership(app, leader_state)
+        assert leader_state.get("conn") is None
+
+        with db.engine.connect() as probe:
+            still_held = probe.execute(
+                text(
+                    "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' "
+                    "AND ((classid::bigint << 32) | objid::bigint) = :key"
+                ),
+                {"key": lock_id},
+            ).scalar()
+        assert still_held == 0
+
+        next_state = {}
+        assert MpesaService._acquire_sweeper_leadership(app, next_state) is True
+        MpesaService._release_sweeper_leadership(app, next_state)
+
+
+@requires_postgres
+def test_sweeper_cycle_against_real_postgres(app, fake_daraja, caplog):
+    """The sweeper cycle runs on PostgreSQL without SWEEPER_LEADERSHIP_ERROR."""
+    fake_daraja(query_response={"ResultCode": "0", "ResultDesc": "Success."})
+    leader_state = {}
+
+    with app.app_context():
+        with caplog.at_level(logging.INFO):
+            MpesaService._sweeper_cycle(app, leader_state)
+
+    assert not any("SWEEPER_LEADERSHIP_ERROR" in r.message for r in caplog.records)
+    assert any("SWEEPER_LEADER_ACQUIRED" in r.message for r in caplog.records)
+    assert any("SWEEPER_CYCLE_STARTED" in r.message for r in caplog.records)
+    assert any("SWEEPER_SUMMARY" in r.message for r in caplog.records)
+    assert leader_state.get("conn") is None
+
+
+# --- status column capacity invariant -----------------------------------
+
+
+def test_every_status_value_fits_the_database_column_width(client):
+    """A status value longer than ``mpesa_transactions.status`` must never reach
+    production silently (it would raise ``StringDataRightTruncation`` on
+    PostgreSQL and 500 the callback/recovery path).
+
+    This pins the contract between the ``MpesaTransactionStatus`` enum and the
+    SQLAlchemy column definition so a future value longer than the column is a
+    hard test failure, not a deploy-time surprise.
+    """
+    status_column = MpesaTransaction.__table__.c.status
+    column_length = status_column.type.length
+    assert column_length is not None, "status column must have a fixed width"
+
+    defined_statuses = [
+        value
+        for name, value in vars(MpesaTransactionStatus).items()
+        if name.isupper() and isinstance(value, str)
+    ]
+    assert defined_statuses, "no MpesaTransactionStatus string values found"
+
+    for status in defined_statuses:
+        assert len(status) <= column_length, (
+            f"status value {status!r} ({len(status)} chars) exceeds the "
+            f"mpesa_transactions.status width of {column_length}; widen the "
+            f"column and its Alembic migration before shipping this value"
+        )
+
+
+def test_reconciliation_pending_persists_and_round_trips(client, create_user):
+    """``RECONCILIATION_PENDING`` (21 chars) must persist and read back intact.
+
+    On PostgreSQL this is the exact regression: the column was ``VARCHAR(20)``,
+    which truncated (and 500'd) this value. SQLite does not enforce the width,
+    so this test is most meaningful on PostgreSQL but still asserts the model
+    contract on every backend.
+    """
+    user = create_user()
+    with client.application.app_context():
+        txn = MpesaTransaction(
+            user_id=user["id"],
+            wallet_id=Wallet.query.filter_by(user_id=user["id"]).first().id,
+            account_reference="ACC-INV",
+            phone_number="254712345678",
+            amount=500,
+            status=MpesaTransactionStatus.RECONCILIATION_PENDING,
+        )
+        db.session.add(txn)
+        db.session.commit()
+
+        stored = MpesaTransaction.query.filter_by(
+            status=MpesaTransactionStatus.RECONCILIATION_PENDING
+        ).first()
+        assert stored is not None
+        assert stored.status == MpesaTransactionStatus.RECONCILIATION_PENDING
+        assert len(stored.status) == len("ReconciliationPending")
+

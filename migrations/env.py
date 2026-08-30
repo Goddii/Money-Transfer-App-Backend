@@ -11,7 +11,14 @@ config = context.config
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.
-fileConfig(config.config_file_name)
+#
+# ``disable_existing_loggers=False`` is required: the default (True) silences
+# every logger that already exists, including the Flask ``app`` logger that
+# carries the structured ``MPESA_EVENT=...`` observability records. Running a
+# migration in-process (as ``tests/test_migrations.py`` and any in-process
+# ``flask db upgrade`` do) would otherwise permanently disable application
+# logging for the rest of that process.
+fileConfig(config.config_file_name, disable_existing_loggers=False)
 logger = logging.getLogger('alembic.env')
 
 

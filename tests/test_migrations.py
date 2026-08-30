@@ -205,6 +205,71 @@ class TestFreshPostgresUpgrade:
             for provider in providers:
                 assert provider.is_active is True
 
+    def test_mpesa_status_column_is_wide_enough_for_reconciliation_pending(
+        self, migrated_app, isolated_schema
+    ):
+        """The widened status column must accept ``RECONCILIATION_PENDING``.
+
+        This is the exact PostgreSQL regression: the column used to be
+        ``VARCHAR(20)`` and ``"ReconciliationPending"`` (21 chars) raised
+        ``StringDataRightTruncation`` on every inconclusive callback/recovery.
+        After upgrade the column must be ``VARCHAR(50)`` and the application
+        must persist and read back the value without error.
+        """
+        from app.extensions import db
+        from app.models import (
+            MpesaTransaction,
+            MpesaTransactionStatus,
+            User,
+            Wallet,
+        )
+        from sqlalchemy import inspect as sa_inspect
+
+        with migrated_app.app_context():
+            status_col = [
+                c
+                for c in sa_inspect(db.engine).get_columns(
+                    "mpesa_transactions", schema=isolated_schema
+                )
+                if c["name"] == "status"
+            ][0]
+            assert "50" in str(status_col["type"]), (
+                f"mpesa_transactions.status should be VARCHAR(50) after "
+                f"upgrade, got {status_col['type']!r}"
+            )
+
+            admin = User(
+                first_name="Mig",
+                last_name="Test",
+                email="mig-status@example.com",
+                role="user",
+                is_active=True,
+                status="Active",
+            )
+            admin.set_password("SecurePass123")
+            db.session.add(admin)
+            db.session.flush()
+            db.session.add(Wallet(user_id=admin.id, balance=0))
+            db.session.commit()
+
+            txn = MpesaTransaction(
+                user_id=admin.id,
+                wallet_id=Wallet.query.filter_by(user_id=admin.id).first().id,
+                account_reference="ACC-MIG",
+                phone_number="254712345678",
+                amount=500,
+                status=MpesaTransactionStatus.RECONCILIATION_PENDING,
+            )
+            db.session.add(txn)
+            db.session.commit()
+
+            stored = MpesaTransaction.query.filter_by(
+                status=MpesaTransactionStatus.RECONCILIATION_PENDING
+            ).first()
+            assert stored is not None
+            assert stored.status == MpesaTransactionStatus.RECONCILIATION_PENDING
+
+
     def test_seed_script_creates_one_idempotent_admin(self, migrated_app):
         """``python seed.py`` logic must be safe to re-run on every deploy.
 

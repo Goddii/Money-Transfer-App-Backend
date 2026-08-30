@@ -258,6 +258,158 @@ class TestListServicesEndpoint:
         types = {s["type"] for s in services}
         assert types == {"ELECTRICITY", "WATER", "AIRTIME"}
 
+    def test_listing_exposes_canonical_service_type_key(
+        self, client, authenticated_user, seed_service_providers
+    ):
+        """Every provider must expose ``service_type`` (the key the POST
+        contract uses), with ``type`` kept as an identical legacy alias.
+
+        Regression guard: the listing previously exposed only ``type``, so a
+        client reading ``service_type`` got ``undefined``/empty and the payment
+        POST was rejected with 400 INVALID_SERVICE_TYPE.
+        """
+        _, headers = authenticated_user(email="svckey@example.com", balance="1000.00")
+        response = client.get(SERVICES_URL, headers=headers)
+
+        assert response.status_code == 200
+        services = response.get_json()["data"]["services"]
+
+        for service in services:
+            assert "service_type" in service
+            assert service["service_type"] in ServiceType.ALL
+            # Legacy alias must stay in sync with the canonical key.
+            assert service["type"] == service["service_type"]
+
+        assert {s["service_type"] for s in services} == set(ServiceType.ALL)
+
+
+class TestServiceTypeContract:
+    """The GET /api/services value must be directly usable in the POST body.
+
+    These tests pin the exact frontend/backend contract: the value returned by
+    ``GET /api/services`` under ``service_type`` is posted verbatim as
+    ``service_type`` to ``POST /api/service-payments``.
+    """
+
+    def test_listed_service_type_is_accepted_verbatim_by_payment_endpoint(
+        self, client, authenticated_user, seed_service_providers
+    ):
+        user, headers = authenticated_user(email="contract@example.com", balance="3000.00")
+
+        listing = client.get(SERVICES_URL, headers=headers)
+        assert listing.status_code == 200
+        services = listing.get_json()["data"]["services"]
+        assert len(services) == 3
+
+        for service in services:
+            service_type = service["service_type"]
+            account_number = (
+                "254111111111" if service_type == "AIRTIME" else SUCCESS_ACCOUNT
+            )
+
+            response = client.post(
+                PAYMENTS_URL,
+                json={
+                    "service_type": service_type,
+                    "account_number": account_number,
+                    "amount": 100,
+                },
+                headers=headers,
+            )
+
+            assert response.status_code == 201, response.get_json()
+            payment = response.get_json()["data"]["payment"]
+            assert payment["service_type"] == service_type
+            assert payment["status"] == ServicePaymentStatus.COMPLETED
+
+    def test_empty_service_type_rejected(self, client, authenticated_user):
+        """The exact payload the broken frontend sent (empty service_type)."""
+        _, headers = authenticated_user(email="emptytype@example.com", balance="1000.00")
+
+        response = client.post(
+            PAYMENTS_URL,
+            json={
+                "service_type": "",
+                "account_number": SUCCESS_ACCOUNT,
+                "amount": 500,
+            },
+            headers=headers,
+        )
+
+        assert response.status_code == 400
+        body = response.get_json()
+        assert body["error"] == "INVALID_SERVICE_TYPE"
+        assert body["message"] == (
+            "Invalid service type. Must be one of: ELECTRICITY, WATER, AIRTIME"
+        )
+
+    def test_null_service_type_rejected(self, client, authenticated_user):
+        _, headers = authenticated_user(email="nulltype@example.com", balance="1000.00")
+
+        response = client.post(
+            PAYMENTS_URL,
+            json={
+                "service_type": None,
+                "account_number": SUCCESS_ACCOUNT,
+                "amount": 500,
+            },
+            headers=headers,
+        )
+
+        assert response.status_code == 400
+        assert response.get_json()["error"] == "INVALID_SERVICE_TYPE"
+
+    def test_display_label_is_rejected(self, client, authenticated_user):
+        """A display label (e.g. "Electricity Bill") is not an enum value."""
+        _, headers = authenticated_user(email="labeltype@example.com", balance="1000.00")
+
+        response = client.post(
+            PAYMENTS_URL,
+            json={
+                "service_type": "Electricity Bill",
+                "account_number": SUCCESS_ACCOUNT,
+                "amount": 500,
+            },
+            headers=headers,
+        )
+
+        assert response.status_code == 400
+        assert response.get_json()["error"] == "INVALID_SERVICE_TYPE"
+
+    @pytest.mark.parametrize(
+        "sent, expected",
+        [
+            ("electricity", "ELECTRICITY"),
+            ("water", "WATER"),
+            ("airtime", "AIRTIME"),
+            ("  Electricity  ", "ELECTRICITY"),
+        ],
+    )
+    def test_case_and_whitespace_are_normalized(
+        self, client, authenticated_user, sent, expected
+    ):
+        """Documented leniency: the backend upper-cases and trims the value.
+
+        Clients should still send the canonical UPPERCASE enum value.
+        """
+        _, headers = authenticated_user(
+            email=f"norm-{expected.lower()}@example.com", balance="1000.00"
+        )
+        account_number = "254111111111" if expected == "AIRTIME" else SUCCESS_ACCOUNT
+
+        response = client.post(
+            PAYMENTS_URL,
+            json={
+                "service_type": sent,
+                "account_number": account_number,
+                "amount": 100,
+            },
+            headers=headers,
+        )
+
+        assert response.status_code == 201, response.get_json()
+        assert response.get_json()["data"]["payment"]["service_type"] == expected
+
 
 class TestCreateServicePaymentEndpoint:
     """POST /api/service-payments"""
