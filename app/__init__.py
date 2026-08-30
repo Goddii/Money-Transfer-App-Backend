@@ -19,6 +19,8 @@ def create_app(config_object=Config):
     from app.models import (
         Beneficiary,
         MpesaTransaction,
+        ServicePayment,
+        ServiceProvider,
         Transaction,
         User,
         Wallet,
@@ -32,6 +34,7 @@ def create_app(config_object=Config):
         auth_bp,
         beneficiary_bp,
         mpesa_bp,
+        service_payment_bp,
         transaction_bp,
         user_bp,
         wallet_bp,
@@ -42,6 +45,7 @@ def create_app(config_object=Config):
     app.register_blueprint(beneficiary_bp, url_prefix='/api/beneficiaries')
     app.register_blueprint(transaction_bp, url_prefix='/api/transactions')
     app.register_blueprint(mpesa_bp, url_prefix='/api/mpesa')
+    app.register_blueprint(service_payment_bp, url_prefix='/api')
     app.register_blueprint(admin_bp)
 
     register_error_handlers(app)
