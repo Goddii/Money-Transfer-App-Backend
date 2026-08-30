@@ -14,6 +14,7 @@ from datetime import datetime
 
 import requests
 from flask import current_app
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from app.extensions import db
@@ -1090,6 +1091,29 @@ class MpesaService:
     # advisory lock the application might use.
     DEFAULT_SWEEPER_LEADER_LOCK_ID = 912374561
 
+    # Session-level advisory lock statements.
+    #
+    # These MUST be run through ``Connection.execute(text(...))`` with bound
+    # parameters and NOT through ``Connection.exec_driver_sql()``:
+    # ``exec_driver_sql()`` deliberately bypasses SQLAlchemy's SQL compilation
+    # and passes the string straight to the DBAPI, so a SQLAlchemy-style
+    # ``:key`` bind is never translated into psycopg2's ``pyformat``
+    # (``%(key)s``) paramstyle. PostgreSQL then receives the literal text
+    # ``pg_try_advisory_lock(:key)`` and fails with
+    # ``syntax error at or near ":"``. ``text()`` compiles the named bind into
+    # whatever paramstyle the driver uses, so the lock id is sent as a real
+    # bound parameter.
+    #
+    # The explicit ``CAST(... AS bigint)`` pins PostgreSQL's function
+    # resolution to the single-argument ``pg_try_advisory_lock(bigint)``
+    # overload no matter how the driver types the parameter.
+    _ACQUIRE_SWEEPER_LOCK_SQL = text(
+        "SELECT pg_try_advisory_lock(CAST(:key AS bigint))"
+    )
+    _RELEASE_SWEEPER_LOCK_SQL = text(
+        "SELECT pg_advisory_unlock(CAST(:key AS bigint))"
+    )
+
     @staticmethod
     def _sweeper_leader_lock_id(app):
         try:
@@ -1132,18 +1156,28 @@ class MpesaService:
                 leader_state["warned_non_pg"] = True
             return True
 
+        conn = None
         try:
-            conn = db.engine.connect()
-            acquired = conn.exec_driver_sql(
-                "SELECT pg_try_advisory_lock(:key)",
+            # The leadership connection is held for the whole cycle. Session
+            # level advisory locks are independent of transaction state, so
+            # AUTOCOMMIT keeps the connection from sitting idle-in-transaction
+            # for the duration of the sweep while the lock semantics stay
+            # exactly the same (only pg_advisory_unlock or the end of the
+            # session releases it).
+            conn = db.engine.connect().execution_options(
+                isolation_level="AUTOCOMMIT"
+            )
+            acquired = conn.execute(
+                MpesaService._ACQUIRE_SWEEPER_LOCK_SQL,
                 {"key": MpesaService._sweeper_leader_lock_id(app)},
             ).scalar()
         except Exception:
             app.logger.exception("MPESA_EVENT=SWEEPER_LEADERSHIP_ERROR")
-            try:
-                conn.close()
-            except Exception:
-                pass
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
             return False
 
         if not acquired:
@@ -1172,8 +1206,8 @@ class MpesaService:
         if conn is None:
             return
         try:
-            conn.exec_driver_sql(
-                "SELECT pg_advisory_unlock(:key)",
+            conn.execute(
+                MpesaService._RELEASE_SWEEPER_LOCK_SQL,
                 {"key": MpesaService._sweeper_leader_lock_id(app)},
             )
         except Exception:

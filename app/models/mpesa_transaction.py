@@ -62,8 +62,13 @@ class MpesaTransaction(db.Model):
     account_reference = db.Column(db.String(20), nullable=False)
     phone_number = db.Column(db.String(20), nullable=False)
     amount = db.Column(db.Numeric(12, 2), nullable=False)
+    # Widened to VARCHAR(50): the ``RECONCILIATION_PENDING`` status value is
+    # 21 characters, which exceeds an earlier 20-character width and caused a
+    # ``StringDataRightTruncation`` on PostgreSQL. 50 leaves ample headroom for
+    # any future status value without risking silent truncation. Must stay in
+    # sync with the Alembic migration that widens the column.
     status = db.Column(
-        db.String(20), nullable=False, default=MpesaTransactionStatus.PENDING
+        db.String(50), nullable=False, default=MpesaTransactionStatus.PENDING
     )
     merchant_request_id = db.Column(db.String(64), nullable=True)
     checkout_request_id = db.Column(db.String(64), unique=True, nullable=True)

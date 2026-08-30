@@ -81,9 +81,14 @@ class ServiceProvider(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
     def to_dict(self):
+        # ``service_type`` is the canonical key: it is the exact enum value the
+        # POST /api/service-payments contract expects in its ``service_type``
+        # field, and it matches ``ServicePayment.to_dict()``. ``type`` is kept
+        # as a legacy alias so older clients keep working.
         return {
             "id": self.id,
             "name": self.name,
+            "service_type": self.service_type,
             "type": self.service_type,
             "display_name": self.display_name,
             "description": self.description,
