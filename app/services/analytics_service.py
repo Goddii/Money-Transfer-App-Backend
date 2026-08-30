@@ -96,7 +96,26 @@ class AnalyticsService:
             )
         ).count()
 
+        total_service_payments = (
+            db.session.query(
+                func.coalesce(func.sum(Transaction.amount), 0)
+            )
+            .filter(
+                Transaction.sender_id == user_id,
+                Transaction.tx_type == TransactionType.SERVICE_PAYMENT,
+                Transaction.status == "Completed",
+            )
+            .scalar()
+            or ZERO_MONEY
+        )
+
+        service_payment_count = Transaction.query.filter(
+            Transaction.sender_id == user_id,
+            Transaction.tx_type == TransactionType.SERVICE_PAYMENT,
+        ).count()
+
         monthly_trend = AnalyticsService._user_monthly_trend(user_id)
+
 
         return {
             "current_balance": float(current_balance),
@@ -104,6 +123,8 @@ class AnalyticsService:
             "total_sent": float(total_sent),
             "total_deposits": float(total_deposits),
             "total_transfers": total_transfers,
+            "total_service_payments": float(total_service_payments),
+            "service_payment_count": service_payment_count,
             "transaction_count": transaction_count,
             "monthly_trend": monthly_trend,
         }
