@@ -5,6 +5,7 @@ from app.routes.wallet_routes import wallet_bp
 from app.routes.beneficiary_routes import beneficiary_bp
 from app.routes.transaction_routes import transaction_bp
 from app.routes.mpesa_routes import mpesa_bp
+from app.routes.service_payment_routes import service_payment_bp
 
 
 __all__ = [
@@ -15,4 +16,5 @@ __all__ = [
     "beneficiary_bp",
     "transaction_bp",
     "mpesa_bp",
+    "service_payment_bp",
 ]
