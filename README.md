@@ -329,6 +329,11 @@ JWT_SECRET_KEY=your-jwt-secret-key
 
 DATABASE_URL=postgresql://username:password@localhost:5432/vyloc
 
+# Required by `python seed.py` to create the first admin. No default is
+# provided, so seeding fails rather than installing a known password.
+ADMIN_EMAIL=admin@example.com
+ADMIN_PASSWORD=
+
 DARAJA_CONSUMER_KEY=
 DARAJA_CONSUMER_SECRET=
 DARAJA_SHORTCODE=
