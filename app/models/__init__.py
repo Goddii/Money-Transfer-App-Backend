@@ -4,6 +4,12 @@ from app.models.transaction import Transaction, TransactionStatus, TransactionTy
 from app.models.beneficiary import Beneficiary
 from app.models.wallet_ledger import LedgerEntryType, WalletLedger
 from app.models.mpesa_transaction import MpesaTransaction, MpesaTransactionStatus
+from app.models.service_payment import (
+    ServicePayment,
+    ServicePaymentStatus,
+    ServiceProvider,
+    ServiceType,
+)
 
 
 __all__ = [
@@ -17,4 +23,8 @@ __all__ = [
     'LedgerEntryType',
     'MpesaTransaction',
     'MpesaTransactionStatus',
+    'ServicePayment',
+    'ServicePaymentStatus',
+    'ServiceProvider',
+    'ServiceType',
 ]

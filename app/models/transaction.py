@@ -12,6 +12,7 @@ class TransactionType:
 
     TRANSFER = 'Transfer'
     DEPOSIT = 'Deposit'
+    SERVICE_PAYMENT = 'ServicePayment'
 
 
 class TransactionStatus:
