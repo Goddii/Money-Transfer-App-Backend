@@ -43,6 +43,28 @@ REQUIRED_CONFIG_KEYS = (
 
 RESULT_DESC_MAX_LENGTH = 255
 
+# Only these Daraja environments are valid. Anything else is normalised to
+# ``sandbox`` (the safe default) at startup so a typo can never silently select
+# a production endpoint while sandbox credentials are used (or vice versa).
+ALLOWED_DARAJA_ENVS = ("sandbox", "production")
+SANDBOX_HOST = "sandbox.safaricom.co.ke"
+PRODUCTION_HOST = "api.safaricom.co.ke"
+
+
+def _url_path(url):
+    """Return just the path component of a URL.
+
+    The full URL (which may embed a host) is never logged in full; only the
+    path is, so this also guards against accidentally logging any query string
+    or credential that might ever be appended upstream.
+    """
+    try:
+        from urllib.parse import urlparse
+
+        return urlparse(url).path or url
+    except Exception:
+        return url
+
 # Daraja STK query ``ResultCode``s that are documented, definitive proof of
 # cancellation/failure and therefore may move a deposit to ``FAILED``.
 #
@@ -100,27 +122,62 @@ class MpesaService:
 
         return base64.b64encode(raw).decode("utf-8")
 
-    # --- Daraja calls --------------------------------------------------
+    # --- low-level Daraja HTTP -----------------------------------------
 
     @staticmethod
-    def get_access_token():
-        """Request a Daraja OAuth access token."""
-        config = MpesaService._config()
+    def _request_json(method, url, *, config, what, **kwargs):
+        """Issue a Daraja HTTP call and return parsed JSON, classifying failure.
+
+        Every failure is translated into a generic, frontend-safe ``ApiError``.
+        The server log carries the diagnostic detail (HTTP status, truncated
+        upstream body, environment, exception class) required to tell the
+        upstream failure categories apart:
+
+        * ``401`` / ``403`` / ``404`` / ``429`` / ``5xx``  (HTTP error status)
+        * ``timeout`` / ``connection`` / ``request`` (network/TLS)
+        * ``non-json`` (a 2xx/error response whose body is not JSON, e.g. an
+          HTML gateway or maintenance page)
+
+        No secret is ever logged: consumer key/secret, access token, the
+        ``Authorization`` header and the passkey are never written to the log,
+        and the full URL is reduced to its path before logging.
+        """
+        env = config.get("DARAJA_ENV", "sandbox")
+        http = requests.get if method == "GET" else requests.post
 
         try:
-            response = requests.get(
-                f"{config['DARAJA_BASE_URL']}{TOKEN_PATH}",
-                auth=(
-                    config["DARAJA_CONSUMER_KEY"],
-                    config["DARAJA_CONSUMER_SECRET"],
-                ),
-                timeout=config["DARAJA_TIMEOUT"],
-            )
-            response.raise_for_status()
-            token = (response.json() or {}).get("access_token")
-        except (requests.RequestException, ValueError) as error:
+            response = http(url, timeout=config["DARAJA_TIMEOUT"], **kwargs)
+        except requests.Timeout:
             current_app.logger.error(
-                "Daraja access token request failed: %s", type(error).__name__
+                "MPESA_EVENT=DARAJA_HTTP_ERROR what=%s env=%s category=timeout",
+                what,
+                env,
+            )
+            raise ApiError(
+                "Could not reach M-Pesa. Please try again.",
+                502,
+                ErrorCode.MPESA_REQUEST_FAILED,
+            )
+        except requests.ConnectionError as error:
+            current_app.logger.error(
+                "MPESA_EVENT=DARAJA_HTTP_ERROR what=%s env=%s category=connection "
+                "error=%s",
+                what,
+                env,
+                type(error).__name__,
+            )
+            raise ApiError(
+                "Could not reach M-Pesa. Please try again.",
+                502,
+                ErrorCode.MPESA_REQUEST_FAILED,
+            )
+        except requests.RequestException as error:
+            current_app.logger.error(
+                "MPESA_EVENT=DARAJA_HTTP_ERROR what=%s env=%s category=request "
+                "error=%s",
+                what,
+                env,
+                type(error).__name__,
             )
             raise ApiError(
                 "Could not reach M-Pesa. Please try again.",
@@ -128,8 +185,163 @@ class MpesaService:
                 ErrorCode.MPESA_REQUEST_FAILED,
             )
 
+        # HTTP error status: distinguish auth/upstream from network failures.
+        if response.status_code >= 400:
+            MpesaService._log_daraja_http_error(what, url, response, env)
+            raise ApiError(
+                "Could not reach M-Pesa. Please try again.",
+                502,
+                ErrorCode.MPESA_REQUEST_FAILED,
+            )
+
+        # Success status but body is not JSON (HTML gateway/error page, etc.).
+        try:
+            data = response.json()
+        except ValueError:
+            current_app.logger.error(
+                "MPESA_EVENT=DARAJA_HTTP_ERROR what=%s env=%s status=%s "
+                "category=non-json",
+                what,
+                env,
+                response.status_code,
+            )
+            raise ApiError(
+                "Could not reach M-Pesa. Please try again.",
+                502,
+                ErrorCode.MPESA_REQUEST_FAILED,
+            )
+
+        if not isinstance(data, dict):
+            data = {}
+
+        return data
+
+    @staticmethod
+    def _log_daraja_http_error(what, url, response, env):
+        """Log an upstream Daraja HTTP error without leaking secrets.
+
+        Logs the status code, the request path (never the full URL), the
+        environment and a *truncated* copy of the upstream body. The body is
+        upstream error detail (never our credentials) but is capped so a large
+        or malformed payload cannot flood the logs.
+        """
+        try:
+            raw = response.text
+        except Exception:
+            raw = ""
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
+        body = (raw or "")[-500:]
+
+        current_app.logger.error(
+            "MPESA_EVENT=DARAJA_HTTP_ERROR what=%s env=%s status=%s url_path=%s "
+            "body=%s",
+            what,
+            env,
+            response.status_code,
+            _url_path(url),
+            body,
+        )
+
+    @staticmethod
+    def validate_daraja_config(app):
+        """Validate Daraja/M-Pesa configuration at application startup.
+
+        Safe-by-default: an invalid ``DARAJA_ENV`` is normalised to ``sandbox``
+        (the safe default) with a warning rather than crashing boot, and an
+        entirely unconfigured deployment (all values empty) only logs a warning
+        — M-Pesa endpoints then return ``503`` at request time via
+        :meth:`_config`. A *partially* configured deployment (some values set,
+        others missing/empty) is a likely misconfiguration and is logged as an
+        error so an operator can spot it.
+
+        Set ``DARAJA_REQUIRE_CONFIG=true`` to turn a partial/empty
+        configuration into a hard startup failure instead of a warning.
+
+        Environment/endpoint mismatches — production env pointing at the sandbox
+        host, or sandbox env pointing at the production host — are logged as
+        errors because they are the classic cause of silent authentication
+        failures (sandbox credentials sent to production, or vice versa).
+        """
+        config = app.config
+        env = (config.get("DARAJA_ENV") or "sandbox").strip().lower()
+
+        if env not in ALLOWED_DARAJA_ENVS:
+            app.logger.error(
+                "MPESA_EVENT=DARAJA_CONFIG_INVALID_ENV env=%s "
+                "reason=unknown_env defaulting_to=sandbox",
+                env,
+            )
+            config["DARAJA_ENV"] = "sandbox"
+            env = "sandbox"
+
+        base_url = (config.get("DARAJA_BASE_URL") or "").lower()
+        if env == "production" and SANDBOX_HOST in base_url:
+            app.logger.error(
+                "MPESA_EVENT=DARAJA_CONFIG_ENV_MISMATCH env=production "
+                "base_url_is_sandbox=true "
+                "reason=sandbox_credentials_would_be_sent_to_production"
+            )
+        elif env == "sandbox" and PRODUCTION_HOST in base_url:
+            app.logger.error(
+                "MPESA_EVENT=DARAJA_CONFIG_ENV_MISMATCH env=sandbox "
+                "base_url_is_production=true "
+                "reason=production_credentials_would_be_sent_to_sandbox"
+            )
+
+        configured = [k for k in REQUIRED_CONFIG_KEYS if config.get(k)]
+        missing = [k for k in REQUIRED_CONFIG_KEYS if not config.get(k)]
+
+        if not configured:
+            app.logger.warning(
+                "MPESA_EVENT=DARAJA_CONFIG_NOT_CONFIGURED "
+                "reason=all_values_empty mpesa_endpoints_will_return_503"
+            )
+            return
+
+        if missing:
+            app.logger.error(
+                "MPESA_EVENT=DARAJA_CONFIG_INCOMPLETE missing=%s",
+                ", ".join(missing),
+            )
+            if str(config.get("DARAJA_REQUIRE_CONFIG", "")).lower() in (
+                "1",
+                "true",
+                "yes",
+            ):
+                raise RuntimeError(
+                    "Daraja M-Pesa configuration is incomplete: "
+                    + ", ".join(missing)
+                )
+
+    # --- Daraja calls --------------------------------------------------
+
+    @staticmethod
+    def get_access_token():
+        """Request a Daraja OAuth access token."""
+        config = MpesaService._config()
+
+        url = f"{config['DARAJA_BASE_URL']}{TOKEN_PATH}"
+        data = MpesaService._request_json(
+            "GET",
+            url,
+            config=config,
+            what="access-token",
+            # HTTP Basic auth: requests builds the ``Authorization`` header from
+            # the consumer key/secret. The header is never logged.
+            auth=(
+                config["DARAJA_CONSUMER_KEY"],
+                config["DARAJA_CONSUMER_SECRET"],
+            ),
+        )
+
+        token = (data or {}).get("access_token")
+
         if not token:
-            current_app.logger.error("Daraja access token response had no token")
+            current_app.logger.error(
+                "MPESA_EVENT=DARAJA_TOKEN_MISSING env=%s",
+                config.get("DARAJA_ENV", "sandbox"),
+            )
             raise ApiError(
                 "Could not reach M-Pesa. Please try again.",
                 502,
@@ -164,26 +376,15 @@ class MpesaService:
             "TransactionDesc": "Vyloc wallet deposit",
         }
 
-        try:
-            response = requests.post(
-                f"{config['DARAJA_BASE_URL']}{STK_PUSH_PATH}",
-                json=payload,
-                headers={"Authorization": f"Bearer {access_token}"},
-                timeout=config["DARAJA_TIMEOUT"],
-            )
-            data = response.json() if response.content else {}
-        except (requests.RequestException, ValueError) as error:
-            current_app.logger.error(
-                "Daraja STK push request failed: %s", type(error).__name__
-            )
-            raise ApiError(
-                "Could not reach M-Pesa. Please try again.",
-                502,
-                ErrorCode.MPESA_REQUEST_FAILED,
-            )
-
-        if not isinstance(data, dict):
-            data = {}
+        url = f"{config['DARAJA_BASE_URL']}{STK_PUSH_PATH}"
+        data = MpesaService._request_json(
+            "POST",
+            url,
+            config=config,
+            what="stk-push",
+            json=payload,
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
 
         return data
 
@@ -211,26 +412,15 @@ class MpesaService:
             "CheckoutRequestID": checkout_request_id,
         }
 
-        try:
-            response = requests.post(
-                f"{config['DARAJA_BASE_URL']}{STK_QUERY_PATH}",
-                json=payload,
-                headers={"Authorization": f"Bearer {access_token}"},
-                timeout=config["DARAJA_TIMEOUT"],
-            )
-            data = response.json() if response.content else {}
-        except (requests.RequestException, ValueError) as error:
-            current_app.logger.error(
-                "Daraja STK query failed: %s", type(error).__name__
-            )
-            raise ApiError(
-                "Could not verify the M-Pesa payment.",
-                502,
-                ErrorCode.MPESA_REQUEST_FAILED,
-            )
-
-        if not isinstance(data, dict):
-            data = {}
+        url = f"{config['DARAJA_BASE_URL']}{STK_QUERY_PATH}"
+        data = MpesaService._request_json(
+            "POST",
+            url,
+            config=config,
+            what="stk-query",
+            json=payload,
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
 
         return data
 

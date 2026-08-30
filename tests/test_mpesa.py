@@ -29,7 +29,7 @@ from app.models import (
     WalletLedger,
 )
 from app.schemas.mpesa_schema import parse_stk_callback
-from app.services.mpesa_service import MpesaService
+from app.services.mpesa_service import MpesaService, REQUIRED_CONFIG_KEYS
 from app.services.wallet_service import WalletService
 from app.utils.errors import ApiError, ErrorCode
 
@@ -66,16 +66,27 @@ requires_sqlite = pytest.mark.skipif(
 
 
 class _FakeResponse:
-    def __init__(self, payload, status_code=200):
-        self._payload = payload
+    def __init__(
+        self, payload=None, status_code=200, non_json=False, content=None
+    ):
+        self._payload = payload if payload is not None else {}
         self.status_code = status_code
-        self.content = b"{}"
+        self._non_json = non_json
+        # A non-JSON response still needs a truthy body so the client treats it
+        # as a real (but unparseable) payload rather than empty.
+        self.content = (
+            content
+            if content is not None
+            else (b"<!doctype html><html>error</html>" if non_json else b"{}")
+        )
 
     def raise_for_status(self):
         if self.status_code >= 400:
             raise requests.HTTPError(f"status {self.status_code}")
 
     def json(self):
+        if self._non_json:
+            raise ValueError("No JSON object could be decoded")
         return self._payload
 
 
@@ -84,13 +95,17 @@ class _FakeDaraja:
 
     The STK Push (``stkpush``) and the server-side reconciliation query
     (``stkpushquery``) are distinct endpoints; the query result is what the
-    service trusts, so the fake lets each be controlled independently.
+    service trusts, so the fake lets each be controlled independently. Each
+    endpoint can be given an explicit HTTP status, a non-JSON body, or forced
+    to raise a network exception, so the failure-classification paths can be
+    exercised directly.
     """
 
     # The service catches these, so the fake must expose the real classes.
     RequestException = requests.RequestException
     ConnectionError = requests.ConnectionError
     HTTPError = requests.HTTPError
+    Timeout = requests.Timeout
 
     def __init__(
         self,
@@ -99,6 +114,12 @@ class _FakeDaraja:
         raise_on_push=False,
         query_response=None,
         raise_on_query=False,
+        token_status=200,
+        token_non_json=False,
+        push_status=200,
+        push_non_json=False,
+        query_status=200,
+        query_non_json=False,
     ):
         self.stk_response = stk_response or {
             "MerchantRequestID": MERCHANT_REQUEST_ID,
@@ -115,12 +136,24 @@ class _FakeDaraja:
             "ResultDesc": "The service request is processed successfully.",
         }
         self.raise_on_query = raise_on_query
+
+        self.token_status = token_status
+        self.token_non_json = token_non_json
+        self.push_status = push_status
+        self.push_non_json = push_non_json
+        self.query_status = query_status
+        self.query_non_json = query_non_json
+
         self.requests = []
 
     def get(self, url, **kwargs):
         self.requests.append(("GET", url, kwargs))
 
-        return _FakeResponse(self.token_response)
+        return _FakeResponse(
+            self.token_response,
+            status_code=self.token_status,
+            non_json=self.token_non_json,
+        )
 
     def post(self, url, **kwargs):
         self.requests.append(("POST", url, kwargs))
@@ -128,12 +161,20 @@ class _FakeDaraja:
         if "stkpushquery" in url:
             if self.raise_on_query:
                 raise requests.ConnectionError("network down")
-            return _FakeResponse(self.query_response)
+            return _FakeResponse(
+                self.query_response,
+                status_code=self.query_status,
+                non_json=self.query_non_json,
+            )
 
         if self.raise_on_push:
             raise requests.ConnectionError("network down")
 
-        return _FakeResponse(self.stk_response)
+        return _FakeResponse(
+            self.stk_response,
+            status_code=self.push_status,
+            non_json=self.push_non_json,
+        )
 
 
 @pytest.fixture
@@ -144,6 +185,7 @@ def fake_daraja(monkeypatch):
         raise_on_push=False,
         query_response=None,
         raise_on_query=False,
+        **kwargs,
     ):
         fake = _FakeDaraja(
             stk_response=stk_response,
@@ -151,6 +193,7 @@ def fake_daraja(monkeypatch):
             raise_on_push=raise_on_push,
             query_response=query_response,
             raise_on_query=raise_on_query,
+            **kwargs,
         )
         monkeypatch.setattr("app.services.mpesa_service.requests", fake)
 
@@ -375,6 +418,257 @@ def test_stk_push_requires_configuration(client, app, authenticated_user, fake_d
 
     assert response.status_code == 503
     assert response.get_json()["error"] == "MPESA_NOT_CONFIGURED"
+
+
+# --- Issue 6: Daraja failure classification & safe diagnostics -------------
+
+
+def test_get_access_token_401_is_logged_with_status(app, fake_daraja, caplog):
+    fake_daraja(token_status=401, token_response={"errorMessage": "Invalid Authentication"})
+    with caplog.at_level(logging.ERROR):
+        with app.app_context():
+            with pytest.raises(ApiError) as exc:
+                MpesaService.get_access_token()
+    assert exc.value.status_code == 502
+    assert any(
+        "DARAJA_HTTP_ERROR" in r.message
+        and "what=access-token" in r.message
+        and "status=401" in r.message
+        for r in caplog.records
+    )
+
+
+def test_get_access_token_403_is_logged_with_status(app, fake_daraja, caplog):
+    fake_daraja(token_status=403, token_response={"errorMessage": "Forbidden"})
+    with caplog.at_level(logging.ERROR):
+        with app.app_context():
+            with pytest.raises(ApiError):
+                MpesaService.get_access_token()
+    assert any("status=403" in r.message for r in caplog.records)
+
+
+def test_get_access_token_404_is_logged_with_status(app, fake_daraja, caplog):
+    fake_daraja(token_status=404, token_response={"errorMessage": "Not Found"})
+    with caplog.at_level(logging.ERROR):
+        with app.app_context():
+            with pytest.raises(ApiError):
+                MpesaService.get_access_token()
+    assert any("status=404" in r.message for r in caplog.records)
+
+
+def test_get_access_token_5xx_is_logged_with_status(app, fake_daraja, caplog):
+    fake_daraja(token_status=503, token_response={"errorMessage": "Service Unavailable"})
+    with caplog.at_level(logging.ERROR):
+        with app.app_context():
+            with pytest.raises(ApiError):
+                MpesaService.get_access_token()
+    assert any("status=503" in r.message for r in caplog.records)
+
+
+def test_get_access_token_timeout_is_classified(app, fake_daraja, caplog):
+    fake = fake_daraja()
+
+    def _timeout(url, **kwargs):
+        raise requests.Timeout("timed out")
+
+    fake.get = _timeout
+    with caplog.at_level(logging.ERROR):
+        with app.app_context():
+            with pytest.raises(ApiError):
+                MpesaService.get_access_token()
+    assert any("category=timeout" in r.message for r in caplog.records)
+
+
+def test_get_access_token_connection_error_is_classified(app, fake_daraja, caplog):
+    fake = fake_daraja()
+
+    def _connerr(url, **kwargs):
+        raise requests.ConnectionError("connection refused")
+
+    fake.get = _connerr
+    with caplog.at_level(logging.ERROR):
+        with app.app_context():
+            with pytest.raises(ApiError):
+                MpesaService.get_access_token()
+    assert any("category=connection" in r.message for r in caplog.records)
+
+
+def test_get_access_token_non_json_response_is_classified(app, fake_daraja, caplog):
+    fake_daraja(token_non_json=True)
+    with caplog.at_level(logging.ERROR):
+        with app.app_context():
+            with pytest.raises(ApiError):
+                MpesaService.get_access_token()
+    assert any(
+        "category=non-json" in r.message for r in caplog.records
+    )
+
+
+def test_send_stk_push_non_json_response_is_classified(
+    client, app, authenticated_user, fake_daraja, caplog
+):
+    # Token request succeeds, but the STK push returns a non-JSON body (e.g. an
+    # HTML gateway/error page). This is the scenario behind the production
+    # ``JSONDecodeError`` log, now classified instead of being opaque.
+    fake_daraja(push_non_json=True)
+    user, headers = authenticated_user(email="depositor@example.com")
+
+    with caplog.at_level(logging.ERROR):
+        response = client.post(
+            STK_PUSH_URL, headers=headers, json={"amount": "500", "phone": "0712345678"}
+        )
+
+    assert response.status_code == 502
+    assert any(
+        "DARAJA_HTTP_ERROR" in r.message
+        and "what=stk-push" in r.message
+        and "category=non-json" in r.message
+        for r in caplog.records
+    )
+
+
+def test_send_stk_push_5xx_is_classified(
+    client, app, authenticated_user, fake_daraja, caplog
+):
+    fake_daraja(push_status=502, stk_response={"errorMessage": "Bad gateway"})
+    user, headers = authenticated_user(email="depositor@example.com")
+
+    with caplog.at_level(logging.ERROR):
+        response = client.post(
+            STK_PUSH_URL, headers=headers, json={"amount": "500", "phone": "0712345678"}
+        )
+
+    assert response.status_code == 502
+    assert any(
+        "DARAJA_HTTP_ERROR" in r.message
+        and "what=stk-push" in r.message
+        and "status=502" in r.message
+        for r in caplog.records
+    )
+
+
+def test_daraja_secrets_are_never_logged(
+    client, app, authenticated_user, fake_daraja, caplog
+):
+    """An upstream error path that logs detail must not leak any secret."""
+    fake_daraja(token_status=401, token_response={"errorMessage": "Invalid Authentication"})
+    user, headers = authenticated_user(email="depositor@example.com")
+
+    with caplog.at_level(logging.ERROR):
+        client.post(
+            STK_PUSH_URL, headers=headers, json={"amount": "500", "phone": "0712345678"}
+        )
+
+    log_text = "".join(r.message for r in caplog.records)
+    assert "test-consumer-key" not in log_text
+    assert "test-consumer-secret" not in log_text
+    assert "test-passkey" not in log_text
+    # The token only ever exists in success bodies, which are never logged.
+    assert "fake-token" not in log_text
+
+
+def test_successful_oauth_then_stk_flow_credits_once_on_confirmation(
+    client, app, authenticated_user, fake_daraja
+):
+    """Regression: a healthy OAuth + STK push still creates a pending deposit."""
+    fake_daraja()
+    user, headers = authenticated_user(email="depositor@example.com", balance="10.00")
+
+    response = client.post(
+        STK_PUSH_URL, headers=headers, json={"amount": "500", "phone": "0712345678"}
+    )
+
+    assert response.status_code == 201
+    with app.app_context():
+        stored = MpesaTransaction.query.one()
+        assert stored.status == MpesaTransactionStatus.PENDING
+
+
+# --- Issue 6: startup configuration validation -----------------------------
+
+
+def test_validate_config_normalizes_invalid_env(app, caplog):
+    app.config["DARAJA_ENV"] = "staging"
+    for key in REQUIRED_CONFIG_KEYS:
+        app.config.setdefault(key, "present")
+
+    with caplog.at_level(logging.ERROR):
+        MpesaService.validate_daraja_config(app)
+
+    assert app.config["DARAJA_ENV"] == "sandbox"
+    assert any("DARAJA_CONFIG_INVALID_ENV" in r.message for r in caplog.records)
+
+
+def test_validate_config_detects_production_sandbox_mismatch(app, caplog):
+    app.config["DARAJA_ENV"] = "production"
+    app.config["DARAJA_BASE_URL"] = "https://sandbox.safaricom.co.ke"
+    for key in REQUIRED_CONFIG_KEYS:
+        app.config.setdefault(key, "present")
+
+    with caplog.at_level(logging.ERROR):
+        MpesaService.validate_daraja_config(app)
+
+    assert any("DARAJA_CONFIG_ENV_MISMATCH" in r.message for r in caplog.records)
+
+
+def test_validate_config_detects_sandbox_production_mismatch(app, caplog):
+    app.config["DARAJA_ENV"] = "sandbox"
+    app.config["DARAJA_BASE_URL"] = "https://api.safaricom.co.ke"
+    for key in REQUIRED_CONFIG_KEYS:
+        app.config.setdefault(key, "present")
+
+    with caplog.at_level(logging.ERROR):
+        MpesaService.validate_daraja_config(app)
+
+    assert any("DARAJA_CONFIG_ENV_MISMATCH" in r.message for r in caplog.records)
+
+
+def test_validate_config_logs_incomplete_configuration(app, caplog):
+    # Partially configured: one value present, the rest empty -> INCOMPLETE.
+    for key in REQUIRED_CONFIG_KEYS:
+        app.config[key] = ""
+    app.config["DARAJA_ENV"] = "sandbox"
+    app.config["DARAJA_CONSUMER_KEY"] = "present"
+
+    with caplog.at_level(logging.ERROR):
+        MpesaService.validate_daraja_config(app)
+
+    assert any("DARAJA_CONFIG_INCOMPLETE" in r.message for r in caplog.records)
+
+
+def test_validate_config_all_empty_is_only_a_warning(app, caplog):
+    for key in REQUIRED_CONFIG_KEYS:
+        app.config[key] = ""
+    app.config["DARAJA_ENV"] = "sandbox"
+
+    with caplog.at_level(logging.WARNING):
+        MpesaService.validate_daraja_config(app)
+
+    assert any("DARAJA_CONFIG_NOT_CONFIGURED" in r.message for r in caplog.records)
+    assert not any("DARAJA_CONFIG_INCOMPLETE" in r.message for r in caplog.records)
+
+
+def test_validate_config_require_flag_hard_fails_on_incomplete(app):
+    for key in REQUIRED_CONFIG_KEYS:
+        app.config[key] = ""
+    app.config["DARAJA_ENV"] = "sandbox"
+    app.config["DARAJA_CONSUMER_KEY"] = "present"
+    app.config["DARAJA_REQUIRE_CONFIG"] = "true"
+
+    with pytest.raises(RuntimeError):
+        MpesaService.validate_daraja_config(app)
+
+
+def test_validate_config_valid_full_config_is_quiet(app, caplog):
+    for key in REQUIRED_CONFIG_KEYS:
+        app.config.setdefault(key, "present")
+    app.config["DARAJA_ENV"] = "sandbox"
+    app.config["DARAJA_BASE_URL"] = "https://sandbox.safaricom.co.ke"
+
+    with caplog.at_level(logging.ERROR):
+        MpesaService.validate_daraja_config(app)
+
+    assert not any("DARAJA_CONFIG" in r.message for r in caplog.records)
 
 
 # --- callback -----------------------------------------------------------

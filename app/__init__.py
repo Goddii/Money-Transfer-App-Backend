@@ -55,6 +55,7 @@ def create_app(config_object=Config):
     # callback never arrives or arrives before Daraja finalises the payment.
     from app.services.mpesa_service import MpesaService
 
+    MpesaService.validate_daraja_config(app)
     MpesaService.start_reconciliation_sweeper(app)
 
     @app.get('/')
