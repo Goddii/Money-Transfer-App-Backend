@@ -9,24 +9,34 @@ class MpesaTransactionStatus:
 
     PENDING              - STK push accepted; awaiting callback/reconciliation.
     RECONCILIATION_PENDING - Payment may have succeeded but server-side
-                           confirmation is currently inconclusive, unavailable,
-                           or cannot yet be credited safely (for example the
-                           callback reported a different amount). Always
-                           recoverable.
+                            confirmation is currently inconclusive, unavailable,
+                            or cannot yet be credited safely (for example the
+                            callback reported a different amount). Always
+                            recoverable.
     COMPLETED            - Daraja server-to-server confirmation succeeded and the
-                           wallet was credited.
+                            wallet was credited.
     FAILED               - Payment failure/cancellation definitively established.
+    MANUAL_REVIEW_REQUIRED - Reconciliation exhausted its automatic budget
+                            (e.g. hit MPESA_MAX_RECONCILIATION_ATTEMPTS) without a
+                            definitive Daraja outcome. The deposit is held, never
+                            auto-credited and never auto-failed; it is excluded
+                            from automatic recovery and must be resolved by a
+                            human. This is a terminal hold state, not a payment
+                            failure.
     """
 
     PENDING = 'Pending'
     RECONCILIATION_PENDING = 'ReconciliationPending'
     COMPLETED = 'Completed'
     FAILED = 'Failed'
+    MANUAL_REVIEW_REQUIRED = 'ManualReviewRequired'
 
     # States from which the deposit can no longer change (terminal).
-    TERMINAL_STATUSES = (COMPLETED, FAILED)
+    TERMINAL_STATUSES = (COMPLETED, FAILED, MANUAL_REVIEW_REQUIRED)
 
-    # States that the recovery service will (re)process.
+    # States that the recovery service will (re)process. Manual review is a
+    # terminal hold and is deliberately NOT recoverable: once a deposit enters
+    # it, no automatic Daraja reconciliation (sweeper/user/admin/callback) runs.
     RECOVERABLE_STATUSES = (PENDING, RECONCILIATION_PENDING)
 
     @classmethod

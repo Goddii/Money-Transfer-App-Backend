@@ -30,6 +30,7 @@ from app.models import (
 )
 from app.schemas.mpesa_schema import parse_stk_callback
 from app.services.mpesa_service import MpesaService, REQUIRED_CONFIG_KEYS
+from app.services import mpesa_service as _mpesa_module
 from app.services.wallet_service import WalletService
 from app.utils.errors import ApiError, ErrorCode
 
@@ -67,7 +68,7 @@ requires_sqlite = pytest.mark.skipif(
 
 class _FakeResponse:
     def __init__(
-        self, payload=None, status_code=200, non_json=False, content=None
+        self, payload=None, status_code=200, non_json=False, content=None, headers=None
     ):
         self._payload = payload if payload is not None else {}
         self.status_code = status_code
@@ -79,6 +80,7 @@ class _FakeResponse:
             if content is not None
             else (b"<!doctype html><html>error</html>" if non_json else b"{}")
         )
+        self.headers = headers or {}
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -120,6 +122,7 @@ class _FakeDaraja:
         push_non_json=False,
         query_status=200,
         query_non_json=False,
+        retry_after=None,
     ):
         self.stk_response = stk_response or {
             "MerchantRequestID": MERCHANT_REQUEST_ID,
@@ -143,16 +146,25 @@ class _FakeDaraja:
         self.push_non_json = push_non_json
         self.query_status = query_status
         self.query_non_json = query_non_json
+        # Optional Retry-After header surfaced on 429 responses.
+        self.retry_after = retry_after
 
         self.requests = []
+
+    def _error_headers(self, status):
+        if status == 429 and self.retry_after is not None:
+            return {"Retry-After": str(self.retry_after)}
+        return {}
 
     def get(self, url, **kwargs):
         self.requests.append(("GET", url, kwargs))
 
+        headers = self._error_headers(self.token_status)
         return _FakeResponse(
             self.token_response,
             status_code=self.token_status,
             non_json=self.token_non_json,
+            headers=headers,
         )
 
     def post(self, url, **kwargs):
@@ -161,19 +173,23 @@ class _FakeDaraja:
         if "stkpushquery" in url:
             if self.raise_on_query:
                 raise requests.ConnectionError("network down")
+            headers = self._error_headers(self.query_status)
             return _FakeResponse(
                 self.query_response,
                 status_code=self.query_status,
                 non_json=self.query_non_json,
+                headers=headers,
             )
 
         if self.raise_on_push:
             raise requests.ConnectionError("network down")
 
+        headers = self._error_headers(self.push_status)
         return _FakeResponse(
             self.stk_response,
             status_code=self.push_status,
             non_json=self.push_non_json,
+            headers=headers,
         )
 
 
@@ -1212,9 +1228,14 @@ def test_genuine_cancellation_marks_failed_no_credit(
 
 
 def test_reconciliation_pending_is_recoverable_via_recovery(
-    client, app, authenticated_user, fake_daraja
+    client, app, authenticated_user, fake_daraja, monkeypatch
 ):
     """C: first reconciliation inconclusive, later reconciliation succeeds."""
+    # Disable per-transaction backoff for this test so the "later" recovery runs
+    # immediately (the backoff behaviour is covered by its own focused test).
+    monkeypatch.setattr(
+        _mpesa_module, "_mpesa_backoff_seconds", lambda attempts, config: 0
+    )
     user, headers = authenticated_user(email="depositor@example.com", balance="10.00")
     with app.app_context():
         wallet = Wallet.query.filter_by(user_id=user["id"]).first()
@@ -1292,6 +1313,94 @@ def test_recovery_timeout_keeps_deposit_recoverable(
 
         assert stored.status == MpesaTransactionStatus.RECONCILIATION_PENDING
         assert stored.reconciliation_attempts >= 1
+
+
+def test_query_403_is_logged_and_keeps_recoverable(client, app, authenticated_user, fake_daraja, caplog):
+    """A 403 from the STK query (e.g. upstream WAF block) is classified and
+    leaves the deposit recoverable rather than failing it or crediting a
+    wallet."""
+    user, headers = authenticated_user(email="depositor@example.com", balance="10.00")
+    with app.app_context():
+        wallet = Wallet.query.filter_by(user_id=user["id"]).first()
+        mpesa_transaction = MpesaTransaction(
+            user_id=user["id"],
+            wallet_id=wallet.id,
+            account_reference="REF403",
+            phone_number="254712345678",
+            amount=Decimal("500.00"),
+            status=MpesaTransactionStatus.PENDING,
+            checkout_request_id="ws_CO_403",
+        )
+        db.session.add(mpesa_transaction)
+        db.session.commit()
+
+    fake_daraja(query_status=403, query_response={"errorMessage": "Forbidden"})
+
+    with caplog.at_level(logging.ERROR):
+        summary = MpesaService.recover_deposits()
+
+    # A 403 (likely Imperva/WAF) triggers the global upstream cooldown and the
+    # deposit is reported as throttled (never credited, never failed, never
+    # charged a per-transaction attempt).
+    assert summary["throttled"] == 1
+    assert any("status=403" in r.message for r in caplog.records)
+
+
+def test_query_429_triggers_global_cooldown_and_no_immediate_retry(client, app, authenticated_user, fake_daraja):
+    """A 429 from Daraja enters a global upstream cooldown (audit finding 5).
+
+    The deposit must NOT be credited, must NOT be marked failed, and must NOT
+    have its per-transaction attempt counter incremented. The very next sweep
+    must not issue another Daraja query because the cooldown is active.
+    """
+    user, headers = authenticated_user(email="depositor@example.com", balance="10.00")
+    with app.app_context():
+        wallet = Wallet.query.filter_by(user_id=user["id"]).first()
+        mpesa_transaction = MpesaTransaction(
+            user_id=user["id"],
+            wallet_id=wallet.id,
+            account_reference="REF429",
+            phone_number="254712345678",
+            amount=Decimal("500.00"),
+            status=MpesaTransactionStatus.PENDING,
+            checkout_request_id="ws_CO_429",
+        )
+        db.session.add(mpesa_transaction)
+        db.session.commit()
+
+    fake = fake_daraja(query_status=429, query_response={"errorMessage": "Spike arrest violation"})
+
+    # First recovery attempt: upstream 429 -> global cooldown, deposit throttled.
+    summary1 = MpesaService.recover_deposits()
+    assert summary1["throttled"] == 1
+
+    with app.app_context():
+        stored = MpesaTransaction.query.filter_by(
+            checkout_request_id="ws_CO_429"
+        ).first()
+        # Upstream 429 must NOT charge a per-transaction attempt.
+        assert stored.reconciliation_attempts == 0
+        assert stored.status == MpesaTransactionStatus.PENDING
+
+    # No immediate second external query: the cooldown suppresses it.
+    before_requests = len(fake.requests)
+    summary2 = MpesaService.recover_deposits()
+    after_requests = len(fake.requests)
+
+    assert after_requests == before_requests
+    assert summary2["throttled"] == 1
+
+
+def test_get_access_token_is_cached_with_ttl(app, fake_daraja):
+    fake = fake_daraja(token_response={"access_token": "cached-token", "expires_in": 60})
+    with app.app_context():
+        t1 = MpesaService.get_access_token()
+        t2 = MpesaService.get_access_token()
+
+    assert t1 == "cached-token"
+    assert t2 == "cached-token"
+    # Only one token HTTP request should have been made.
+    assert len(fake.requests) == 1
 
 
 def test_duplicate_recovery_does_not_double_credit(
@@ -1772,7 +1881,7 @@ def test_recovery_sweep_isolates_row_failure(
 
 
 def test_inconclusive_callback_is_recoverable_and_user_reconcile_credits(
-    client, app, authenticated_user, fake_daraja
+    client, app, authenticated_user, fake_daraja, monkeypatch
 ):
     """Core race repro: callback arrives before Daraja finalises the payment.
 
@@ -1784,6 +1893,11 @@ def test_inconclusive_callback_is_recoverable_and_user_reconcile_credits(
     "paid but not credited" intermittent failure.
     """
     user, headers = authenticated_user(email="depositor@example.com", balance="10.00")
+    # Disable per-transaction backoff so the user-triggered "later" reconcile runs
+    # immediately (backoff behaviour is covered by its own focused test).
+    monkeypatch.setattr(
+        _mpesa_module, "_mpesa_backoff_seconds", lambda attempts, config: 0
+    )
     _initiate_deposit(client, headers, fake_daraja)
 
     # Callback arrives; Daraja's authoritative query is still inconclusive.
@@ -2735,4 +2849,637 @@ def test_reconciliation_pending_persists_and_round_trips(client, create_user):
         assert stored is not None
         assert stored.status == MpesaTransactionStatus.RECONCILIATION_PENDING
         assert len(stored.status) == len("ReconciliationPending")
+
+
+# ===========================================================================
+# Audit-fix focused regression tests
+# ===========================================================================
+
+
+def test_token_cache_resets_cleanly(app, fake_daraja):
+    """reset_token_cache() must clear cached tokens so a later call refetches."""
+    fake_daraja(token_response={"access_token": "tok-A"})
+    with app.app_context():
+        assert MpesaService.get_access_token() == "tok-A"
+    fake_daraja(token_response={"access_token": "tok-B"})
+    with app.app_context():
+        # Still cached from before the reset.
+        assert MpesaService.get_access_token() == "tok-A"
+        MpesaService.reset_token_cache()
+        # After reset a fresh token is fetched.
+        assert MpesaService.get_access_token() == "tok-B"
+
+
+def test_token_cache_isolated_by_env_and_credentials(app, fake_daraja):
+    """Sandbox and production credentials must never share a token."""
+    sandbox_cfg = {
+        "DARAJA_BASE_URL": "https://sandbox.safaricom.co.ke",
+        "DARAJA_CONSUMER_KEY": "sandbox-key",
+        "DARAJA_ENV": "sandbox",
+    }
+    prod_cfg = {
+        "DARAJA_BASE_URL": "https://api.safaricom.co.ke",
+        "DARAJA_CONSUMER_KEY": "prod-key",
+        "DARAJA_ENV": "production",
+    }
+    cache = _mpesa_module._token_cache
+    cache.reset()
+    cache.set(sandbox_cfg, "S", 100)
+    cache.set(prod_cfg, "P", 100)
+
+    assert cache.get(sandbox_cfg) == "S"
+    assert cache.get(prod_cfg) == "P"
+
+    # Invalidating the sandbox token must not affect the production token.
+    cache.invalidate(sandbox_cfg)
+    assert cache.get(sandbox_cfg) is None
+    assert cache.get(prod_cfg) == "P"
+
+
+def test_backoff_behaves_under_non_utc_timezone(app, create_user, fake_daraja, monkeypatch):
+    """Per-transaction backoff must be timezone-safe (audit finding B2).
+
+    ``last_reconciled_at`` is stored as naive UTC and compared with
+    ``datetime.utcnow()``, so the decision is identical under UTC and any host
+    timezone (e.g. Africa/Nairobi). We set TZ and assert a recently-reconciled
+    deposit is still skipped (not queried).
+    """
+    import time as _time
+
+    monkeypatch.setenv("TZ", "Africa/Nairobi")
+    try:
+        _time.tzset()
+    except AttributeError:
+        pass  # Windows lacks tzset; the arithmetic is tz-independent regardless.
+
+    fake_daraja(query_response={"ResultCode": "0", "ResultDesc": "Success."})
+    user = create_user(email="tz@example.com", balance="10.00")
+    with app.app_context():
+        wallet = Wallet.query.filter_by(user_id=user["id"]).first()
+        m = MpesaTransaction(
+            user_id=user["id"],
+            wallet_id=wallet.id,
+            account_reference="REFTZ",
+            phone_number="254712345678",
+            amount=Decimal("500.00"),
+            status=MpesaTransactionStatus.PENDING,
+            checkout_request_id="ws_CO_tz",
+            reconciliation_attempts=5,
+            last_reconciled_at=datetime.utcnow() - timedelta(seconds=1),
+        )
+        db.session.add(m)
+        db.session.commit()
+
+    # With 5 attempts the TestConfig backoff (base 1s, cap 10s) keeps this well
+    # beyond 1s, so it must be skipped without querying Daraja.
+    summary = MpesaService.recover_deposits()
+    assert summary["reconciliation_pending"] == 1
+
+
+def test_global_rate_limiter_throttles_concurrent_callers():
+    """The in-process token bucket denies once capacity is exhausted."""
+    from app.services.mpesa_service import _LocalThrottleState
+
+    state = _LocalThrottleState(capacity=2, refill_per_sec=0.0)
+    assert state.acquire_permit()[0] is True
+    assert state.acquire_permit()[0] is True
+    assert state.acquire_permit()[0] is False
+
+    results = []
+
+    def worker():
+        results.append(state.acquire_permit()[0])
+
+    threads = [threading.Thread(target=worker) for _ in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert all(r is False for r in results)
+
+
+def test_daraja_limiter_denies_when_budget_exhausted(app):
+    """A zero-capacity limiter must deny on the in-process path."""
+    app.config["DARAJA_RATE_LIMIT_CAPACITY"] = 0
+    app.config["DARAJA_RATE_LIMIT_REFILL_PER_SEC"] = 0
+    MpesaService.reset_daraja_throttle()
+    granted, _ = MpesaService._daraja_acquire_permit(app.config, "test")
+    assert granted is False
+
+
+@requires_postgres
+def test_postgres_limiter_shared_across_calls(app):
+    """The PostgreSQL token bucket is shared: capacity is enforced across calls."""
+    app.config["DARAJA_RATE_LIMIT_CAPACITY"] = 2
+    app.config["DARAJA_RATE_LIMIT_REFILL_PER_SEC"] = 0.0
+    with app.app_context():
+        g1, _ = MpesaService._daraja_acquire_permit(app.config, "x")
+        g2, _ = MpesaService._daraja_acquire_permit(app.config, "x")
+        g3, _ = MpesaService._daraja_acquire_permit(app.config, "x")
+    assert g1 is True
+    assert g2 is True
+    assert g3 is False
+
+
+def test_retry_after_is_respected_on_429(app, create_user, fake_daraja):
+    """A 429 with Retry-After must drive a cooldown of roughly that duration."""
+    fake = fake_daraja(query_status=429, retry_after=3)
+    user = create_user(email="retry@example.com", balance="10.00")
+    with app.app_context():
+        wallet = Wallet.query.filter_by(user_id=user["id"]).first()
+        m = MpesaTransaction(
+            user_id=user["id"],
+            wallet_id=wallet.id,
+            account_reference="REFRETRY",
+            phone_number="254712345678",
+            amount=Decimal("500.00"),
+            status=MpesaTransactionStatus.PENDING,
+            checkout_request_id="ws_CO_retry",
+        )
+        db.session.add(m)
+        db.session.commit()
+
+    with app.app_context():
+        MpesaService.recover_deposits()
+        remaining = MpesaService._daraja_cooldown_remaining(app.config)
+
+    # Retry-After=3, capped at DARAJA_COOLDOWN_429_MAX_SECONDS=5 (TestConfig).
+    assert remaining > 2
+    assert remaining <= 5
+
+
+def test_403_activates_upstream_cooldown(app, create_user, fake_daraja):
+    """A 403 (likely Imperva/WAF) must activate a global upstream cooldown."""
+    fake = fake_daraja(query_status=403)
+    user = create_user(email="waf@example.com", balance="10.00")
+    with app.app_context():
+        wallet = Wallet.query.filter_by(user_id=user["id"]).first()
+        m = MpesaTransaction(
+            user_id=user["id"],
+            wallet_id=wallet.id,
+            account_reference="REFWAF",
+            phone_number="254712345678",
+            amount=Decimal("500.00"),
+            status=MpesaTransactionStatus.PENDING,
+            checkout_request_id="ws_CO_waf",
+        )
+        db.session.add(m)
+        db.session.commit()
+
+    with app.app_context():
+        summary = MpesaService.recover_deposits()
+        assert summary["throttled"] == 1
+        remaining = MpesaService._daraja_cooldown_remaining(app.config)
+
+    # TestConfig 403 cooldown is 5s, far longer than the 1s 429 cooldown.
+    assert remaining >= 4
+
+
+def test_upstream_403_does_not_increment_attempts(app, create_user, fake_daraja):
+    """A 403 upstream signal must not charge a per-transaction attempt (finding 9)."""
+    fake = fake_daraja(query_status=403)
+    user = create_user(email="waf2@example.com", balance="10.00")
+    with app.app_context():
+        wallet = Wallet.query.filter_by(user_id=user["id"]).first()
+        m = MpesaTransaction(
+            user_id=user["id"],
+            wallet_id=wallet.id,
+            account_reference="REFWAF2",
+            phone_number="254712345678",
+            amount=Decimal("500.00"),
+            status=MpesaTransactionStatus.PENDING,
+            checkout_request_id="ws_CO_waf2",
+        )
+        db.session.add(m)
+        db.session.commit()
+
+    with app.app_context():
+        summary = MpesaService.recover_deposits()
+        assert summary["throttled"] == 1
+        stored = MpesaTransaction.query.filter_by(
+            checkout_request_id="ws_CO_waf2"
+        ).first()
+        assert stored.reconciliation_attempts == 0
+        assert stored.status == MpesaTransactionStatus.PENDING
+
+
+def test_callback_respects_global_limiter(client, app, authenticated_user, fake_daraja, monkeypatch):
+    """The callback path routes through the global limiter (audit finding 6).
+
+    When the limiter denies the permit, the callback must keep the deposit
+    recoverable, must NOT credit, and must NOT charge a per-transaction attempt.
+    """
+    _, headers = authenticated_user(email="lim@example.com", balance="10.00")
+    _initiate_deposit(client, headers, fake_daraja)
+    monkeypatch.setattr(
+        MpesaService,
+        "_daraja_acquire_permit",
+        staticmethod(lambda config, what: (False, 30)),
+    )
+
+    response = client.post(CALLBACK_URL, json=_callback_payload())
+
+    assert response.status_code == 200
+    with app.app_context():
+        stored = MpesaTransaction.query.one()
+        assert stored.status == MpesaTransactionStatus.RECONCILIATION_PENDING
+        assert stored.reconciliation_attempts == 0
+        assert Transaction.query.count() == 0
+
+
+def test_callback_duplicate_query_prevented(client, app, authenticated_user, fake_daraja, monkeypatch):
+    """Two simultaneous callbacks for one checkout must issue exactly one
+    Daraja query (audit finding 6: short-lived dedup by checkout_request_id).
+    """
+    user, headers = authenticated_user(email="dup@example.com", balance="10.00")
+    _initiate_deposit(client, headers, fake_daraja)
+    fake = fake_daraja(query_response={"ResultCode": "0", "ResultDesc": "Success."})
+
+    # Slow the query just enough that the second callback arrives mid-query, so
+    # the dedup guard actually has a chance to suppress the duplicate.
+    orig_q = MpesaService.query_stk_status
+
+    def slow_query(checkout_request_id):
+        time.sleep(0.2)
+        return orig_q(checkout_request_id)
+
+    monkeypatch.setattr(
+        MpesaService, "query_stk_status", staticmethod(slow_query)
+    )
+
+    def run_callback():
+        with app.app_context():
+            parsed = parse_stk_callback(
+                _callback_payload(result_code=0, checkout_request_id=CHECKOUT_REQUEST_ID)
+            )
+            MpesaService.process_callback(parsed)
+
+    t1 = threading.Thread(target=run_callback)
+    t2 = threading.Thread(target=run_callback)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    query_posts = [
+        r for r in fake.requests if r[0] == "POST" and "stkpushquery" in r[1]
+    ]
+    assert len(query_posts) == 1
+    assert _balance(app, user["id"]) == Decimal("510.00")
+
+
+def test_max_attempts_transitions_to_manual_review(app, create_user, fake_daraja):
+    """Exhausting MPESA_MAX_RECONCILIATION_ATTEMPTS -> ManualReviewRequired."""
+    fake = fake_daraja(query_response={"ResultCode": "0", "ResultDesc": "Success."})
+    user = create_user(email="max@example.com", balance="10.00")
+    with app.app_context():
+        wallet = Wallet.query.filter_by(user_id=user["id"]).first()
+        m = MpesaTransaction(
+            user_id=user["id"],
+            wallet_id=wallet.id,
+            account_reference="REFMAX",
+            phone_number="254712345678",
+            amount=Decimal("500.00"),
+            status=MpesaTransactionStatus.RECONCILIATION_PENDING,
+            checkout_request_id="ws_CO_max",
+            reconciliation_attempts=48,
+        )
+        db.session.add(m)
+        db.session.commit()
+        app.config["MPESA_MAX_RECONCILIATION_ATTEMPTS"] = 48
+
+    with app.app_context():
+        summary = MpesaService.recover_deposits()
+
+    assert summary["manual_review"] == 1
+    with app.app_context():
+        stored = MpesaTransaction.query.filter_by(
+            checkout_request_id="ws_CO_max"
+        ).first()
+        assert stored.status == MpesaTransactionStatus.MANUAL_REVIEW_REQUIRED
+        assert Transaction.query.count() == 0
+        assert WalletLedger.query.count() == 0
+
+
+def test_manual_review_not_selected_by_recovery(app, create_user, fake_daraja):
+    """A ManualReviewRequired deposit is excluded from automatic recovery."""
+    fake = fake_daraja(query_response={"ResultCode": "0", "ResultDesc": "Success."})
+    user = create_user(email="mr@example.com", balance="10.00")
+    with app.app_context():
+        wallet = Wallet.query.filter_by(user_id=user["id"]).first()
+        m = MpesaTransaction(
+            user_id=user["id"],
+            wallet_id=wallet.id,
+            account_reference="REFMR",
+            phone_number="254712345678",
+            amount=Decimal("500.00"),
+            status=MpesaTransactionStatus.MANUAL_REVIEW_REQUIRED,
+            checkout_request_id="ws_CO_mr",
+            reconciliation_attempts=70,
+        )
+        db.session.add(m)
+        db.session.commit()
+
+    with app.app_context():
+        summary = MpesaService.recover_deposits()
+
+    assert summary["processed"] == 0
+    assert summary["credited"] == 0
+    with app.app_context():
+        stored = MpesaTransaction.query.filter_by(
+            checkout_request_id="ws_CO_mr"
+        ).first()
+        assert stored.status == MpesaTransactionStatus.MANUAL_REVIEW_REQUIRED
+        assert Transaction.query.count() == 0
+        assert not any(
+            r[0] == "POST" and "stkpushquery" in r[1] for r in fake.requests
+        )
+
+
+def test_no_open_transaction_during_daraja_http(app, create_user, fake_daraja, monkeypatch):
+    """No DB transaction is held open while the Daraja HTTP call is in flight."""
+    user = create_user(email="notx@example.com", balance="10.00")
+    with app.app_context():
+        wallet = Wallet.query.filter_by(user_id=user["id"]).first()
+        m = MpesaTransaction(
+            user_id=user["id"],
+            wallet_id=wallet.id,
+            account_reference="REFNTX",
+            phone_number="254712345678",
+            amount=Decimal("500.00"),
+            status=MpesaTransactionStatus.PENDING,
+            checkout_request_id="ws_CO_notx",
+        )
+        db.session.add(m)
+        db.session.commit()
+
+    captured = {}
+    orig = MpesaService.query_stk_status
+
+    def spy(checkout_request_id):
+        captured["open_tx"] = db.session().get_transaction() is not None
+        return orig(checkout_request_id)
+
+    monkeypatch.setattr(MpesaService, "query_stk_status", staticmethod(spy))
+    fake = fake_daraja(query_response={"ResultCode": "0", "ResultDesc": "Success."})
+
+    with app.app_context():
+        MpesaService.recover_deposits()
+
+    assert captured.get("open_tx") is False
+
+
+def test_stale_401_token_invalidated_and_retried_once(app, fake_daraja, monkeypatch):
+    """A 401 on the query invalidates the cached token and retries exactly once."""
+    calls = {"token": 0, "query": 0}
+
+    class _SeqFake:
+        RequestException = requests.RequestException
+        ConnectionError = requests.ConnectionError
+
+        def __init__(self):
+            self.requests = []
+
+        def get(self, url, **kwargs):
+            calls["token"] += 1
+            token = "tok-B" if calls["token"] > 1 else "tok-A"
+            return _FakeResponse({"access_token": token})
+
+        def post(self, url, **kwargs):
+            calls["query"] += 1
+            if calls["query"] == 1:
+                return _FakeResponse({"errorMessage": "Unauthorized"}, status_code=401)
+            return _FakeResponse({"ResultCode": "0", "ResultDesc": "Success."})
+
+    fake = _SeqFake()
+    monkeypatch.setattr("app.services.mpesa_service.requests", fake)
+
+    with app.app_context():
+        MpesaService.get_access_token()
+        # First query 401 -> invalidate + one fresh token -> second query 200.
+        result = MpesaService.query_stk_status("ws_CO_401")
+
+    assert result.get("ResultCode") == "0"
+    # Exactly one retry: two token fetches, two queries, no loop.
+    assert calls["token"] == 2
+    assert calls["query"] == 2
+
+
+def test_403_query_does_not_retry_token(app, fake_daraja, monkeypatch):
+    """A 403 (WAF) must NOT trigger a token re-authentication loop."""
+    calls = {"token": 0, "query": 0}
+
+    class _SeqFake:
+        RequestException = requests.RequestException
+        ConnectionError = requests.ConnectionError
+
+        def __init__(self):
+            self.requests = []
+
+        def get(self, url, **kwargs):
+            calls["token"] += 1
+            return _FakeResponse({"access_token": "tok"})
+
+        def post(self, url, **kwargs):
+            calls["query"] += 1
+            return _FakeResponse({"errorMessage": "Forbidden"}, status_code=403)
+
+    fake = _SeqFake()
+    monkeypatch.setattr("app.services.mpesa_service.requests", fake)
+
+    with app.app_context():
+        with pytest.raises(Exception):
+            MpesaService.query_stk_status("ws_CO_403")
+
+    # Only the initial token fetch; the 403 cooldown is raised without retry.
+    assert calls["token"] == 1
+    assert calls["query"] == 1
+
+
+def test_result_code_zero_is_only_automatic_credit_path(app, create_user, fake_daraja):
+    """Financial safety: only ResultCode 0 credits; others never do (findings 17/18)."""
+    for code, expect_credit in [
+        ("0", True),
+        ("1032", False),
+        ("9999", False),
+        ("1037", False),
+    ]:
+        fake = fake_daraja(
+            query_response={"ResultCode": code, "ResultDesc": "x"}
+        )
+        user = create_user(email=f"fin{code}@example.com", balance="10.00")
+        with app.app_context():
+            wallet = Wallet.query.filter_by(user_id=user["id"]).first()
+            m = MpesaTransaction(
+                user_id=user["id"],
+                wallet_id=wallet.id,
+                account_reference=f"REFF{code}",
+                phone_number="254712345678",
+                amount=Decimal("500.00"),
+                status=MpesaTransactionStatus.PENDING,
+                checkout_request_id=f"ws_fin_{code}",
+            )
+            db.session.add(m)
+            db.session.commit()
+
+        with app.app_context():
+            MpesaService.recover_deposits()
+
+        with app.app_context():
+            stored = MpesaTransaction.query.filter_by(
+                checkout_request_id=f"ws_fin_{code}"
+            ).first()
+            wallet = Wallet.query.filter_by(user_id=user["id"]).first()
+            balance = Decimal(str(wallet.balance))
+            if expect_credit:
+                assert stored.status == MpesaTransactionStatus.COMPLETED
+                assert balance == Decimal("510.00")
+            else:
+                assert stored.status != MpesaTransactionStatus.COMPLETED
+                assert balance == Decimal("10.00")
+
+
+@requires_postgres
+def test_advisory_lock_contention_does_not_leak_connection(
+    app, create_user, fake_daraja, monkeypatch
+):
+    """When another process holds the per-transaction advisory lock, _recover_one
+    returns 'skipped' and must NOT leak its dedicated DB connection (finding B1).
+    """
+    user = create_user(email="leak@example.com", balance="10.00")
+    with app.app_context():
+        wallet = Wallet.query.filter_by(user_id=user["id"]).first()
+        m = MpesaTransaction(
+            user_id=user["id"],
+            wallet_id=wallet.id,
+            account_reference="REFLEAK",
+            phone_number="254712345678",
+            amount=Decimal("500.00"),
+            status=MpesaTransactionStatus.PENDING,
+            checkout_request_id="ws_CO_leak",
+        )
+        db.session.add(m)
+        db.session.commit()
+        tx_id = m.id
+
+    fake_daraja(query_response={"ResultCode": "0", "ResultDesc": "Success."})
+
+    # Track every connection opened on the engine.
+    opened = []
+    real_connect = db.engine.connect
+
+    class _Tracked:
+        def __init__(self, conn):
+            self._conn = conn
+            self.closed = False
+            opened.append(self)
+
+        def execution_options(self, **kw):
+            self._conn = self._conn.execution_options(**kw)
+            return self
+
+        def execute(self, *a, **k):
+            return self._conn.execute(*a, **k)
+
+        def close(self):
+            self.closed = True
+            return self._conn.close()
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.close()
+            return False
+
+    def _connect():
+        return _Tracked(real_connect())
+
+    monkeypatch.setattr(db.engine, "connect", _connect)
+
+    # Hold the two-argument advisory lock for this transaction in a separate
+    # connection so the recovery sees contention.
+    holder = db.engine.connect()
+    holder.execute(
+        text(
+        "SELECT pg_advisory_lock("
+        "CAST(:k1 AS integer), CAST(:k2 AS integer))"
+        ),
+        {"k1": _mpesa_module.TX_ADVISORY_NAMESPACE, "k2": tx_id},
+    )
+    try:
+        with app.app_context():
+            summary = MpesaService.recover_deposits()
+        assert summary["skipped"] == 1
+    finally:
+        # The advisory lock is owned by ``holder`` (the simulating "other
+        # process"); it must be released on that same connection, not a
+        # different one, and the connection then closed so it cannot leak.
+        try:
+            holder.execute(
+                text(
+                    "SELECT pg_advisory_unlock("
+                    "CAST(:k1 AS integer), CAST(:k2 AS integer))"
+                ),
+                {"k1": _mpesa_module.TX_ADVISORY_NAMESPACE, "k2": tx_id},
+            )
+        finally:
+            holder.close()
+
+    # Every dedicated connection opened by the recovery must be closed.
+    assert opened, "no advisory-lock connection was opened"
+    assert all(c.closed for c in opened), "advisory-lock connection leaked"
+
+
+@requires_postgres
+def test_advisory_lock_held_through_state_commit(app, create_user, fake_daraja, monkeypatch):
+    """The per-transaction advisory lock remains held until the reconciliation
+    state update commits (audit findings 8/1)."""
+    user = create_user(email="hold@example.com", balance="10.00")
+    with app.app_context():
+        wallet = Wallet.query.filter_by(user_id=user["id"]).first()
+        m = MpesaTransaction(
+            user_id=user["id"],
+            wallet_id=wallet.id,
+            account_reference="REFHOLD",
+            phone_number="254712345678",
+            amount=Decimal("500.00"),
+            status=MpesaTransactionStatus.PENDING,
+            checkout_request_id="ws_CO_hold",
+        )
+        db.session.add(m)
+        db.session.commit()
+
+    fake_daraja(query_response={"ResultCode": "0", "ResultDesc": "Success."})
+
+    captured = {}
+    orig = MpesaService._apply_reconciliation
+
+    def spy(mpesa_transaction_id, checkout_request_id, query_result):
+        with db.engine.connect() as probe:
+            held = probe.execute(
+                text(
+                    "SELECT count(*) FROM pg_locks "
+                    "WHERE locktype = 'advisory' AND "
+                    "((classid::bigint << 32) | objid::bigint) = "
+                    "(CAST(:ns AS bigint) << 32 | CAST(:id AS bigint))"
+                ),
+                {
+                    "ns": _mpesa_module.TX_ADVISORY_NAMESPACE,
+                    "id": mpesa_transaction_id,
+                },
+            ).scalar()
+        captured["held"] = held
+        return orig(mpesa_transaction_id, checkout_request_id, query_result)
+
+    monkeypatch.setattr(MpesaService, "_apply_reconciliation", staticmethod(spy))
+
+    with app.app_context():
+        MpesaService.recover_deposits()
+
+    assert captured.get("held", 0) >= 1
 
