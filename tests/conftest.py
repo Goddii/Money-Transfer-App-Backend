@@ -18,6 +18,21 @@ from app import create_app
 from app.config import TestConfig
 from app.extensions import db
 from app.models import User, Wallet
+from app.services.mpesa_service import MpesaService
+
+
+@pytest.fixture(autouse=True)
+def _isolate_daraja_state(app):
+    """Reset Daraja token cache + rate-limiter/cooldown between tests.
+
+    Guarantees environment/credential isolation for the token cache and stops a
+    global upstream cooldown or throttled budget set by one test from leaking
+    into the next, so the focused Daraja tests do not depend on execution order.
+    """
+    with app.app_context():
+        MpesaService.reset_token_cache()
+        MpesaService.reset_daraja_throttle()
+    yield
 
 DEFAULT_PASSWORD = "SecurePass123"
 

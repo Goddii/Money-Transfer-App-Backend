@@ -29,6 +29,9 @@ from app.utils.helpers import (
     truncate,
 )
 
+import random
+import threading
+
 TOKEN_PATH = "/oauth/v1/generate?grant_type=client_credentials"
 STK_PUSH_PATH = "/mpesa/stkpush/v1/processrequest"
 STK_QUERY_PATH = "/mpesa/stkpushquery/v1/query"
@@ -64,6 +67,230 @@ def _url_path(url):
         return urlparse(url).path or url
     except Exception:
         return url
+
+
+class DarajaHttpError(ApiError):
+    """Raised for classified HTTP errors from Daraja.
+
+    Carries the upstream HTTP status so callers can decide backoff behaviour
+    without inspecting logs. This is an internal refinement of ``ApiError``
+    and is never leaked to end-users.
+    """
+
+    def __init__(self, message, http_status=None, status_code=502, error_code=ErrorCode.MPESA_REQUEST_FAILED):
+        super().__init__(message, status_code=status_code, error_code=error_code)
+        self.http_status = http_status
+
+
+class DarajaThrottled(DarajaHttpError):
+    """Raised when the shared Daraja rate limiter refuses a permit.
+
+    This is a controlled, application-wide rejection (not an upstream error):
+    the caller must treat it like an upstream-unavailable condition — do NOT
+    credit, do NOT mark the deposit failed, and do NOT increment the
+    per-transaction reconciliation attempt counter.
+    """
+
+    def __init__(self, retry_after=None, reason=None):
+        super().__init__(
+            "M-Pesa is rate limited. Please try again shortly.",
+            http_status=429,
+        )
+        self.retry_after = retry_after
+        self.reason = reason
+
+
+class DarajaUpstreamCooldown(DarajaHttpError):
+    """Raised when Daraja is in a global upstream cooldown (403/429/5xx).
+
+    Like :class:`DarajaThrottled`, this must NOT be charged as a per-transaction
+    reconciliation attempt and must NOT change a deposit's financial state.
+    """
+
+    def __init__(self, http_status=429, retry_after=None, reason=None):
+        super().__init__(
+            "M-Pesa upstream is temporarily unavailable.",
+            http_status=http_status,
+        )
+        self.retry_after = retry_after
+        self.reason = reason
+
+
+# ---------------------------------------------------------------------------
+# Token cache (keyed, thread-safe, test-isolatable)
+# ---------------------------------------------------------------------------
+#
+# Tokens are cached per (DARAJA_BASE_URL, DARAJA_CONSUMER_KEY) so that sandbox
+# and production credentials can never share a token, and so that an app
+# instance / test can reset the cache without leaking state into another. The
+# cache is in-process (one per worker); it only ever holds short-lived bearer
+# tokens and is purely a performance optimisation, never a correctness source.
+
+class DarajaTokenCache:
+    """Thread-safe, environment/credential-keyed Daraja OAuth token cache."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._entries = {}  # key -> (token, expires_at_epoch)
+
+    @staticmethod
+    def _key(config):
+        base_url = (config.get("DARAJA_BASE_URL") or "").lower()
+        consumer_key = config.get("DARAJA_CONSUMER_KEY") or ""
+        # Include the environment as a defensive belt-and-braces check so a
+        # misconfigured sandbox/base-url combo still cannot reuse a token.
+        env = (config.get("DARAJA_ENV") or "sandbox").lower()
+        return (base_url, env, consumer_key)
+
+    def get(self, config, *, skew=10.0):
+        key = self._key(config)
+        now = time.time()
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                return None
+            token, expires_at = entry
+            if now >= (expires_at - skew):
+                # Expired (or within the safety skew): drop it.
+                self._entries.pop(key, None)
+                return None
+            return token
+
+    def set(self, config, token, ttl):
+        key = self._key(config)
+        with self._lock:
+            self._entries[key] = (token, time.time() + float(ttl))
+
+    def invalidate(self, config):
+        key = self._key(config)
+        with self._lock:
+            self._entries.pop(key, None)
+
+    def reset(self):
+        with self._lock:
+            self._entries.clear()
+
+
+# Module-level singleton. Tests reset this between cases via
+# ``MpesaService.reset_token_cache()``.
+_token_cache = DarajaTokenCache()
+
+
+# ---------------------------------------------------------------------------
+# Global Daraja rate limiter + upstream cooldown
+# ---------------------------------------------------------------------------
+#
+# Daraja's quota is application-wide, so every outbound Daraja call (OAuth, STK
+# Push, STK Query, reconciliation, callback-triggered queries, sweeper, admin)
+# is funnelled through one shared limiter. An in-process token bucket is used
+# where PostgreSQL is unavailable (single process only); on PostgreSQL a
+# database-backed token bucket row is shared across all workers/instances so
+# the limiter is truly cross-process.
+#
+# A separate upstream cooldown is raised on 403/429/5xx so that a single global
+# upstream incident does not inflate every pending transaction's attempt
+# counter. Both mechanisms fail OPEN (admit the request) if the coordination
+# store is unreachable, because stranding genuine deposits is worse than the
+# (already cooldown-bounded) risk of briefly over-calling Daraja.
+
+class _LocalThrottleState:
+    """In-process token bucket + cooldown used when PostgreSQL is absent."""
+
+    def __init__(self, capacity, refill_per_sec):
+        self._lock = threading.Lock()
+        self.capacity = float(capacity)
+        self.refill_per_sec = float(refill_per_sec)
+        self.tokens = float(capacity)
+        self.last_refill = time.monotonic()
+        self.cooldown_until = 0.0
+        self.cooldown_reason = None
+
+    def _refill(self, now):
+        elapsed = now - self.last_refill
+        if elapsed > 0:
+            self.tokens = min(self.capacity, self.tokens + elapsed * self.refill_per_sec)
+            self.last_refill = now
+
+    def cooldown_remaining(self, now=None):
+        now = now if now is not None else time.monotonic()
+        remaining = self.cooldown_until - now
+        return max(0.0, remaining)
+
+    def set_cooldown(self, seconds, reason):
+        with self._lock:
+            self.cooldown_until = max(self.cooldown_until, time.monotonic() + float(seconds))
+            self.cooldown_reason = reason
+
+    def acquire_permit(self):
+        with self._lock:
+            now = time.monotonic()
+            self._refill(now)
+            if self.cooldown_remaining(now) > 0:
+                return False, self.cooldown_remaining(now)
+            if self.tokens >= 1:
+                self.tokens -= 1
+                return True, 0.0
+            deficit = 1 - self.tokens
+            wait = deficit / self.refill_per_sec if self.refill_per_sec > 0 else 60.0
+            return False, wait
+
+
+# In-process singleton. Rebuilt from config by ``reset_daraja_throttle()`` so
+# tests can install a tight budget without relying on test order.
+_local_throttle = None
+_local_throttle_lock = threading.Lock()
+
+# Stable, application-specific namespace for per-transaction advisory locks so
+# they can never collide with the sweeper leader advisory lock (which uses the
+# single-argument form). Two-argument advisory locks are keyed by (classid,
+# objid); we fix classid here and pass the transaction id as objid.
+TX_ADVISORY_NAMESPACE = 0x4D50  # 'MP'
+
+# Short-lived in-process deduplication of concurrent callback-triggered Daraja
+# queries, keyed by checkout_request_id (see ``_callback_query``). Prevents two
+# simultaneous callbacks for the same checkout from issuing duplicate Daraja
+# queries. The global limiter is the cross-process safeguard; this is the
+# same-process, same-checkout guard. An in-flight entry lives only for the
+# duration of one query and is removed afterwards, so it is inherently
+# short-lived and cannot accumulate.
+_CALLBACK_DEDUP_GUARD = threading.Lock()
+_callback_inflight = {}
+
+
+def _mpesa_backoff_seconds(attempts, config):
+    """Conservative, config-driven exponential backoff (no 24h waits).
+
+    Applied only to *genuine* reconciliation outcomes (inconclusive / network),
+    never to Daraja 403/429 (those are handled by the global upstream
+    cooldown). ``last_reconciled_at`` is stored as naive UTC, so the elapsed
+    time is computed with ``(datetime.utcnow() - last_reconciled_at)`` to stay
+    timezone-safe under UTC, Africa/Nairobi and any host timezone.
+    """
+    base = 30
+    max_backoff = 1800
+    try:
+        base = int(config.get("MPESA_BACKOFF_BASE_SECONDS", 30))
+    except (TypeError, ValueError):
+        base = 30
+    try:
+        max_backoff = int(config.get("MPESA_BACKOFF_MAX_SECONDS", 1800))
+    except (TypeError, ValueError):
+        max_backoff = 1800
+
+    if base < 1:
+        base = 1
+    if max_backoff < base:
+        max_backoff = base
+
+    try:
+        secs = min(max_backoff, base * (2 ** max(0, int(attempts))))
+    except (OverflowError, ValueError):
+        secs = max_backoff
+
+    # Small jitter to avoid a thundering herd without exceeding the cap.
+    jitter = random.uniform(0, max(1, secs * 0.1)) if secs > 0 else 0
+    return int(secs + jitter)
+
 
 # Daraja STK query ``ResultCode``s that are documented, definitive proof of
 # cancellation/failure and therefore may move a deposit to ``FAILED``.
@@ -122,10 +349,300 @@ class MpesaService:
 
         return base64.b64encode(raw).decode("utf-8")
 
+    # --- token cache + global rate limiter/cooldown control -----------
+
+    @staticmethod
+    def reset_token_cache():
+        """Reset the process-wide Daraja token cache.
+
+        Tests (and app instances) call this to guarantee environment/credential
+        isolation: a freshly reset cache can never return a token cached under a
+        different Daraja base URL or consumer key.
+        """
+        _token_cache.reset()
+
+    @staticmethod
+    def reset_daraja_throttle():
+        """Rebuild the in-process rate-limiter/cooldown state from config.
+
+        PostgreSQL-backed throttling state lives in the database. That table is
+        not a SQLAlchemy model, so the test fixture's drop_all/create_all does
+        not recreate it; without an explicit reset the budget row from a prior
+        test would leak across tests. We therefore also reset the shared bucket
+        row so a per-test budget is deterministic. (In production this method is
+        only invoked by the test fixture, never at runtime.)
+        """
+        global _local_throttle
+        config = current_app.config
+        try:
+            capacity = float(config.get("DARAJA_RATE_LIMIT_CAPACITY", 5))
+            refill = float(config.get("DARAJA_RATE_LIMIT_REFILL_PER_SEC", 0.4167))
+        except (TypeError, ValueError):
+            capacity, refill = 5.0, 0.4167
+        with _local_throttle_lock:
+            _local_throttle = _LocalThrottleState(capacity, refill)
+
+        if MpesaService._use_postgres_throttle():
+            try:
+                MpesaService._pg_reset_throttle_row(capacity, refill)
+            except Exception:
+                current_app.logger.exception(
+                    "MPESA_EVENT=DARAJA_THROTTLE_RESET_ERROR"
+                )
+
+    @staticmethod
+    def _local_throttle_state():
+        global _local_throttle
+        if _local_throttle is None:
+            MpesaService.reset_daraja_throttle()
+        return _local_throttle
+
+    @staticmethod
+    def _use_postgres_throttle():
+        try:
+            return db.engine.dialect.name == "postgresql"
+        except Exception:
+            return False
+
+    @staticmethod
+    def _daraja_cooldown_remaining(config):
+        """Seconds left on the global upstream cooldown (0.0 if none)."""
+        if MpesaService._use_postgres_throttle():
+            return MpesaService._pg_cooldown_remaining()
+        return MpesaService._local_throttle_state().cooldown_remaining()
+
+    @staticmethod
+    def _daraja_set_cooldown(config, seconds, reason):
+        """Enter a global upstream cooldown (403/429/5xx)."""
+        try:
+            seconds = float(seconds)
+        except (TypeError, ValueError):
+            seconds = 30.0
+        if seconds < 0:
+            seconds = 0.0
+        if MpesaService._use_postgres_throttle():
+            MpesaService._pg_set_cooldown(seconds, reason)
+        else:
+            MpesaService._local_throttle_state().set_cooldown(seconds, reason)
+        current_app.logger.error(
+            "MPESA_EVENT=DARAJA_COOLDOWN_STARTED seconds=%s reason=%s",
+            int(seconds),
+            reason,
+        )
+
+    @staticmethod
+    def _daraja_acquire_permit(config, what):
+        """Acquire one shared Daraja permit. Returns (granted, retry_after)."""
+        if MpesaService._use_postgres_throttle():
+            return MpesaService._pg_acquire_permit(config)
+        return MpesaService._local_throttle_state().acquire_permit()
+
+    # --- PostgreSQL-backed shared token bucket (cross-process) ----------
+
+    _PG_THROTTLE_TABLE = "daraja_throttle"
+    _PG_THROTTLE_ID = 1
+
+    @staticmethod
+    def _pg_ensure_throttle_row(conn):
+        """Create the single shared limiter row if it does not yet exist.
+
+        Capacity/refill come from config at creation time; a focused test that
+        wants a tight budget must set the config before the first acquire.
+        """
+        config = current_app.config
+        try:
+            capacity = float(config.get("DARAJA_RATE_LIMIT_CAPACITY", 5))
+            refill = float(config.get("DARAJA_RATE_LIMIT_REFILL_PER_SEC", 0.4167))
+        except (TypeError, ValueError):
+            capacity, refill = 5.0, 0.4167
+
+        # Self-heal: create the shared limiter table if it is missing (e.g. when
+        # the schema is built via ``db.create_all()`` instead of the Alembic
+        # migration). Idempotent and schema-compatible with migration
+        # a1b2c3d4e5f6 so it is a no-op wherever the migration already ran.
+        ts_type = (
+            "TIMESTAMP WITH TIME ZONE"
+            if conn.dialect.name == "postgresql"
+            else "TIMESTAMP"
+        )
+        conn.execute(
+            text(
+                f"CREATE TABLE IF NOT EXISTS daraja_throttle ("
+                f"id INTEGER PRIMARY KEY, "
+                f"tokens NUMERIC(12,4) NOT NULL, "
+                f"last_refill {ts_type} NOT NULL, "
+                f"capacity NUMERIC(12,4) NOT NULL, "
+                f"refill_per_sec NUMERIC(18,6) NOT NULL, "
+                f"cooldown_until {ts_type}, "
+                f"cooldown_reason VARCHAR(50))"
+            )
+        )
+
+        conn.execute(
+            text(
+                "INSERT INTO daraja_throttle "
+                "(id, tokens, last_refill, capacity, refill_per_sec) "
+                "VALUES (:id, :cap, now(), :cap, :ref) "
+                "ON CONFLICT (id) DO NOTHING"
+            ),
+            {
+                "id": MpesaService._PG_THROTTLE_ID,
+                "cap": capacity,
+                "ref": refill,
+            },
+        )
+
+    @staticmethod
+    def _pg_reset_throttle_row(capacity, refill):
+        """Recreate the shared limiter row with the given budget.
+
+        Used by ``reset_daraja_throttle()`` so each test starts from a fresh,
+        deterministic bucket. Idempotent on the table schema.
+        """
+        with db.engine.connect().execution_options(
+            isolation_level="AUTOCOMMIT"
+        ) as conn:
+            MpesaService._pg_ensure_throttle_row(conn)
+            conn.execute(
+                text("DELETE FROM daraja_throttle WHERE id = :id"),
+                {"id": MpesaService._PG_THROTTLE_ID},
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO daraja_throttle "
+                    "(id, tokens, last_refill, capacity, refill_per_sec) "
+                    "VALUES (:id, :cap, now(), :cap, :ref)"
+                ),
+                {
+                    "id": MpesaService._PG_THROTTLE_ID,
+                    "cap": capacity,
+                    "ref": refill,
+                },
+            )
+
+    @staticmethod
+    def _pg_cooldown_remaining():
+        try:
+            conn = db.engine.connect().execution_options(
+                isolation_level="AUTOCOMMIT"
+            )
+            try:
+                row = conn.execute(
+                    text(
+                        "SELECT GREATEST(0, EXTRACT(EPOCH FROM "
+                        "(cooldown_until - now()))) "
+                        "FROM daraja_throttle WHERE id = :id"
+                    ),
+                    {"id": MpesaService._PG_THROTTLE_ID},
+                ).first()
+                if row is None:
+                    return 0.0
+                return float(row[0] or 0.0)
+            finally:
+                conn.close()
+        except Exception:
+            current_app.logger.exception(
+                "MPESA_EVENT=DARAJA_THROTTLE_READ_ERROR"
+            )
+            return 0.0
+
+    @staticmethod
+    def _pg_set_cooldown(seconds, reason):
+        try:
+            conn = db.engine.connect().execution_options(
+                isolation_level="AUTOCOMMIT"
+            )
+            try:
+                MpesaService._pg_ensure_throttle_row(conn)
+                conn.execute(
+                    text(
+                        "UPDATE daraja_throttle SET "
+                        "cooldown_until = GREATEST(cooldown_until, "
+                        "now() + (:secs * INTERVAL '1 second')), "
+                        "cooldown_reason = :reason "
+                        "WHERE id = :id"
+                    ),
+                    {
+                        "secs": float(seconds),
+                        "reason": reason,
+                        "id": MpesaService._PG_THROTTLE_ID,
+                    },
+                )
+            finally:
+                conn.close()
+        except Exception:
+            current_app.logger.exception("MPESA_EVENT=DARAJA_COOLDOWN_ERROR")
+
+    @staticmethod
+    def _pg_acquire_permit(config):
+        """Atomically consume one token from the shared bucket (fail open).
+
+        ``capacity``/``refill_per_sec`` are the rate-limit *policy* and are read
+        live from config (so a deployment can change the budget without a DB
+        migration and tests can install a tight budget); the row only holds the
+        shared mutable token state (``tokens``/``last_refill``) and the global
+        cooldown.
+        """
+        try:
+            capacity = float(config.get("DARAJA_RATE_LIMIT_CAPACITY", 5))
+            refill = float(config.get("DARAJA_RATE_LIMIT_REFILL_PER_SEC", 0.4167))
+        except (TypeError, ValueError):
+            capacity, refill = 5.0, 0.4167
+        try:
+            conn = db.engine.connect().execution_options(
+                isolation_level="AUTOCOMMIT"
+            )
+            try:
+                MpesaService._pg_ensure_throttle_row(conn)
+                granted = (
+                    conn.execute(
+                        text(
+                            "UPDATE daraja_throttle SET "
+                            "tokens = LEAST(:cap, tokens + EXTRACT(EPOCH FROM "
+                            "(now() - last_refill)) * :ref) - 1, "
+                            "last_refill = now() "
+                            "WHERE id = :id "
+                            "  AND (cooldown_until IS NULL OR cooldown_until <= now()) "
+                            "  AND LEAST(:cap, tokens + EXTRACT(EPOCH FROM "
+                            "(now() - last_refill)) * :ref) >= 1 "
+                            "RETURNING 1"
+                        ),
+                        {
+                            "id": MpesaService._PG_THROTTLE_ID,
+                            "cap": capacity,
+                            "ref": refill,
+                        },
+                    ).rowcount
+                    == 1
+                )
+                if granted:
+                    return True, 0.0
+                row = conn.execute(
+                    text(
+                        "SELECT GREATEST(0, EXTRACT(EPOCH FROM "
+                        "(cooldown_until - now()))), tokens, "
+                        "EXTRACT(EPOCH FROM (now() - last_refill)) "
+                        "FROM daraja_throttle WHERE id = :id"
+                    ),
+                    {"id": MpesaService._PG_THROTTLE_ID},
+                ).first()
+                cooldown_rem, tokens, since_refill = row or (0, 0, 0)
+                tokens = float(tokens or 0)
+                since_refill = float(since_refill or 0)
+                deficit = 1 - min(capacity, tokens + since_refill * refill)
+                wait = deficit / refill if refill else 60.0
+                return False, max(float(cooldown_rem), float(wait))
+            finally:
+                conn.close()
+        except Exception:
+            current_app.logger.exception("MPESA_EVENT=DARAJA_THROTTLE_ERROR")
+            return True, 0.0
+
     # --- low-level Daraja HTTP -----------------------------------------
 
     @staticmethod
     def _request_json(method, url, *, config, what, **kwargs):
+
         """Issue a Daraja HTTP call and return parsed JSON, classifying failure.
 
         Every failure is translated into a generic, frontend-safe ``ApiError``.
@@ -144,6 +661,38 @@ class MpesaService:
         """
         env = config.get("DARAJA_ENV", "sandbox")
         http = requests.get if method == "GET" else requests.post
+
+        # 1) Global upstream cooldown: if Daraja is in a cooldown (403/429/5xx
+        #    seen cluster-wide), do NOT make another outbound request and do NOT
+        #    charge this as a per-transaction attempt. Fail the call safely.
+        cooldown_remaining = MpesaService._daraja_cooldown_remaining(config)
+        if cooldown_remaining > 0:
+            current_app.logger.error(
+                "MPESA_EVENT=DARAJA_REQUEST_SKIPPED what=%s env=%s "
+                "reason=global_cooldown remaining_seconds=%s",
+                what,
+                env,
+                int(cooldown_remaining),
+            )
+            raise DarajaUpstreamCooldown(
+                http_status=429,
+                retry_after=cooldown_remaining,
+                reason="global_cooldown",
+            )
+
+        # 2) Global shared rate limiter: one application-wide choke point for
+        #    every Daraja call (OAuth, STK Push, STK Query, reconciliation,
+        #    callback, sweeper, admin). Cross-process on PostgreSQL.
+        granted, retry_after = MpesaService._daraja_acquire_permit(config, what)
+        if not granted:
+            current_app.logger.error(
+                "MPESA_EVENT=DARAJA_REQUEST_SKIPPED what=%s env=%s "
+                "reason=rate_limited retry_after=%s",
+                what,
+                env,
+                int(retry_after) if retry_after else None,
+            )
+            raise DarajaThrottled(retry_after=retry_after, reason="rate_limited")
 
         try:
             response = http(url, timeout=config["DARAJA_TIMEOUT"], **kwargs)
@@ -185,13 +734,60 @@ class MpesaService:
                 ErrorCode.MPESA_REQUEST_FAILED,
             )
 
-        # HTTP error status: distinguish auth/upstream from network failures.
+        # HTTP error status: classify and, for global upstream signals
+        # (429/403/5xx), enter a cluster-wide cooldown so one incident does not
+        # inflate every pending transaction's attempt counter.
         if response.status_code >= 400:
             MpesaService._log_daraja_http_error(what, url, response, env)
-            raise ApiError(
+
+            status = response.status_code
+            retry_after = None
+            if status == 429:
+                # Honour Retry-After when present (capped defensively).
+                raw_retry = None
+                try:
+                    raw_retry = response.headers.get("Retry-After")
+                except Exception:
+                    raw_retry = None
+                retry_after = MpesaService._parse_retry_after(raw_retry, config)
+                cooldown = max(
+                    retry_after or 0,
+                    config.get("DARAJA_COOLDOWN_429_SECONDS", 30),
+                )
+                cooldown = min(
+                    cooldown, config.get("DARAJA_COOLDOWN_429_MAX_SECONDS", 120)
+                )
+                MpesaService._daraja_set_cooldown(
+                    config, cooldown, "daraja_429"
+                )
+                raise DarajaUpstreamCooldown(
+                    http_status=429, retry_after=retry_after, reason="daraja_429"
+                )
+            if status == 403:
+                # Likely Imperva/WAF. Longer cooldown; do NOT auto-retry the
+                # request (a fresh token cannot clear a WAF block).
+                MpesaService._daraja_set_cooldown(
+                    config,
+                    config.get("DARAJA_COOLDOWN_403_SECONDS", 300),
+                    "daraja_403",
+                )
+                raise DarajaUpstreamCooldown(
+                    http_status=403, reason="daraja_403"
+                )
+            if 500 <= status < 600:
+                MpesaService._daraja_set_cooldown(
+                    config,
+                    config.get("DARAJA_COOLDOWN_5XX_SECONDS", 30),
+                    "daraja_5xx",
+                )
+                raise DarajaUpstreamCooldown(
+                    http_status=status, reason="daraja_5xx"
+                )
+            # 401 (stale token) / 404 / other: raise a plain DarajaHttpError so
+            # the caller (query/stk) can invalidate the token and retry once.
+            raise DarajaHttpError(
                 "Could not reach M-Pesa. Please try again.",
-                502,
-                ErrorCode.MPESA_REQUEST_FAILED,
+                http_status=status,
             )
 
         # Success status but body is not JSON (HTML gateway/error page, etc.).
@@ -215,6 +811,43 @@ class MpesaService:
             data = {}
 
         return data
+
+    @staticmethod
+    def _parse_retry_after(raw, config):
+        """Parse an upstream ``Retry-After`` value into a bounded seconds float.
+
+        Accepts either an integer number of seconds or a HTTP-date. Returns
+        ``None`` when missing/unparseable. Capped by
+        ``DARAJA_COOLDOWN_429_MAX_SECONDS`` so a hostile or buggy value cannot
+        park the limiter forever.
+        """
+        if raw is None:
+            return None
+        try:
+            return min(
+                float(raw), config.get("DARAJA_COOLDOWN_429_MAX_SECONDS", 120)
+            )
+        except (TypeError, ValueError):
+            pass
+        # HTTP-date form, e.g. "Wed, 21 Oct 2026 07:28:00 GMT".
+        try:
+            from email.utils import parsedate_to_datetime
+
+            when = parsedate_to_datetime(str(raw))
+            if when is None:
+                return None
+            from datetime import datetime as _dt
+
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=_dt.utcnow().tzinfo)
+            delta = (when - _dt.now(when.tzinfo)).total_seconds()
+            if delta <= 0:
+                return None
+            return min(
+                delta, config.get("DARAJA_COOLDOWN_429_MAX_SECONDS", 120)
+            )
+        except Exception:
+            return None
 
     @staticmethod
     def _log_daraja_http_error(what, url, response, env):
@@ -317,9 +950,19 @@ class MpesaService:
     # --- Daraja calls --------------------------------------------------
 
     @staticmethod
-    def get_access_token():
-        """Request a Daraja OAuth access token."""
+    def get_access_token(force_refresh=False):
+        """Request (or return a cached) Daraja OAuth access token.
+
+        The cache is keyed by Daraja base URL + consumer key (see
+        :class:`DarajaTokenCache`) so sandbox and production credentials can
+        never share a token, and a reset clears every environment at once.
+        """
         config = MpesaService._config()
+
+        if not force_refresh:
+            cached = _token_cache.get(config)
+            if cached is not None:
+                return cached
 
         url = f"{config['DARAJA_BASE_URL']}{TOKEN_PATH}"
         data = MpesaService._request_json(
@@ -327,8 +970,6 @@ class MpesaService:
             url,
             config=config,
             what="access-token",
-            # HTTP Basic auth: requests builds the ``Authorization`` header from
-            # the consumer key/secret. The header is never logged.
             auth=(
                 config["DARAJA_CONSUMER_KEY"],
                 config["DARAJA_CONSUMER_SECRET"],
@@ -336,6 +977,7 @@ class MpesaService:
         )
 
         token = (data or {}).get("access_token")
+        expires_in = (data or {}).get("expires_in")
 
         if not token:
             current_app.logger.error(
@@ -348,14 +990,67 @@ class MpesaService:
                 ErrorCode.MPESA_REQUEST_FAILED,
             )
 
+        # Cache token with a conservative TTL. If Daraja does not return
+        # expires_in, fall back to 50 minutes.
+        ttl = None
+        try:
+            if isinstance(expires_in, (int, float)):
+                ttl = float(expires_in)
+            elif isinstance(expires_in, str) and expires_in.isdigit():
+                ttl = float(expires_in)
+        except Exception:
+            ttl = None
+
+        if ttl is None:
+            ttl = 50 * 60
+
+        _token_cache.set(config, token, ttl)
+
         return token
+
+    @staticmethod
+    def _authed_request(method, url, *, config, what, json=None):
+        """Make a Daraja call that needs a bearer token, with one safe retry.
+
+        If Daraja rejects the (cached) token with a genuine ``401``, the cached
+        token is invalidated and exactly one fresh token is fetched and retried.
+        This is bounded: original request -> invalidate -> one fresh token ->
+        one retry -> stop. Cooldown/rate-limit errors (``DarajaUpstreamCooldown``,
+        ``DarajaThrottled``) are never retried here — they propagate so the
+        caller can keep the deposit recoverable without charging an attempt.
+        """
+        token = MpesaService.get_access_token()
+        try:
+            return MpesaService._request_json(
+                method,
+                url,
+                config=config,
+                what=what,
+                json=json,
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        except DarajaHttpError as error:
+            if (
+                error.http_status == 401
+                and not isinstance(error, DarajaUpstreamCooldown)
+            ):
+                _token_cache.invalidate(config)
+                token = MpesaService.get_access_token(force_refresh=True)
+                return MpesaService._request_json(
+                    method,
+                    url,
+                    config=config,
+                    what=what,
+                    json=json,
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            raise
 
     @staticmethod
     def send_stk_push(amount, phone, account_reference):
         """Send the STK Push request and return the Daraja response payload."""
         config = MpesaService._config()
 
-        access_token = MpesaService.get_access_token()
         timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
         shortcode = str(config["DARAJA_SHORTCODE"])
 
@@ -377,16 +1072,9 @@ class MpesaService:
         }
 
         url = f"{config['DARAJA_BASE_URL']}{STK_PUSH_PATH}"
-        data = MpesaService._request_json(
-            "POST",
-            url,
-            config=config,
-            what="stk-push",
-            json=payload,
-            headers={"Authorization": f"Bearer {access_token}"},
+        return MpesaService._authed_request(
+            "POST", url, config=config, what="stk-push", json=payload
         )
-
-        return data
 
     @staticmethod
     def query_stk_status(checkout_request_id):
@@ -397,9 +1085,13 @@ class MpesaService:
         authenticated with the consumer key/secret that only the backend holds,
         making it the authoritative source for whether the payment actually
         succeeded. ``checkout_request_id`` is supplied by Daraja, not the client.
+
+        Every outbound Daraja call (including this one) passes through the
+        shared global rate limiter and upstream cooldown in :meth:`_request_json`,
+        so the callback path is protected exactly like the sweeper/admin/user
+        paths.
         """
         config = MpesaService._config()
-        access_token = MpesaService.get_access_token()
         timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
         shortcode = str(config["DARAJA_SHORTCODE"])
         password = MpesaService._build_password(
@@ -413,16 +1105,9 @@ class MpesaService:
         }
 
         url = f"{config['DARAJA_BASE_URL']}{STK_QUERY_PATH}"
-        data = MpesaService._request_json(
-            "POST",
-            url,
-            config=config,
-            what="stk-query",
-            json=payload,
-            headers={"Authorization": f"Bearer {access_token}"},
+        return MpesaService._authed_request(
+            "POST", url, config=config, what="stk-query", json=payload
         )
-
-        return data
 
     @staticmethod
     def reject_unauthorized_source(request):
@@ -688,13 +1373,52 @@ class MpesaService:
 
         # Phase 2 — reconcile with Daraja (authenticated server-to-server). NO
         # database transaction or row lock is held during this network call.
-        try:
-            query_result = MpesaService.query_stk_status(checkout_request_id)
-        except ApiError:
-            # Could not reach Daraja: do NOT credit and do NOT mark the deposit
-            # failed. Acquire the row lock, re-read the latest state, and only
-            # then keep the deposit recoverable — a concurrent callback/sweeper
-            # may already have credited it.
+        # The query is deduplicated per checkout_request_id and funnelled through
+        # the shared global rate limiter / upstream cooldown, but it deliberately
+        # does NOT apply the per-transaction reconciliation backoff: a callback is
+        # an external event and must be handled promptly.
+        query_result, performed_query, throttled = MpesaService._callback_query(
+            checkout_request_id
+        )
+
+        if not performed_query:
+            # Another in-flight callback is already reconciling this exact
+            # checkout request. Re-read the latest state under a lock and return
+            # it without issuing a second Daraja query (no duplicate query, no
+            # credit). The dedup guard guarantees at most one Daraja query per
+            # checkout request at any instant.
+            current_app.logger.info(
+                "MPESA_EVENT=CALLBACK_DEDUP_SKIP mpesa_transaction=%s "
+                "checkout_request_id=%s",
+                mpesa_transaction_id,
+                checkout_request_id,
+            )
+            locked = MpesaService._lock_mpesa_transaction(mpesa_transaction_id)
+            if locked is None:
+                db.session.rollback()
+                return None
+            db.session.rollback()
+            return locked
+
+        if throttled:
+            # Global upstream cooldown / rate limit: do NOT credit, do NOT mark
+            # failed, and do NOT charge a per-transaction attempt. Keep recoverable.
+            current_app.logger.error(
+                "MPESA_EVENT=CALLBACK_THROTTLED mpesa_transaction=%s "
+                "checkout_request_id=%s",
+                mpesa_transaction_id,
+                checkout_request_id,
+            )
+            return MpesaService._callback_keep_recoverable(
+                mpesa_transaction_id, parsed_callback, checkout_request_id,
+                record_attempt=False,
+            )
+
+        if query_result is None:
+            # Daraja could not be reached (network/timeout): do NOT credit and do
+            # NOT mark the deposit failed. Acquire the row lock, re-read the latest
+            # state, and only then keep the deposit recoverable — a concurrent
+            # callback/sweeper may already have credited it.
             return MpesaService._callback_keep_recoverable(
                 mpesa_transaction_id, parsed_callback, checkout_request_id
             )
@@ -785,13 +1509,19 @@ class MpesaService:
         return mpesa_transaction
 
     @staticmethod
-    def _callback_keep_recoverable(mpesa_transaction_id, parsed_callback, checkout_request_id):
+    def _callback_keep_recoverable(
+        mpesa_transaction_id, parsed_callback, checkout_request_id, record_attempt=True
+    ):
         """Daraja unreachable from the callback: keep the deposit recoverable.
 
         Re-acquires the row lock, re-reads the latest state, and only then marks
         the deposit ``RECONCILIATION_PENDING``. A concurrent callback/sweeper may
         already have credited or failed the deposit, in which case we leave it
         untouched rather than clobbering its terminal state.
+
+        ``record_attempt`` is ``False`` when the callback was blocked by the global
+        upstream cooldown / rate limiter: an upstream-wide incident must never
+        charge a per-transaction reconciliation attempt.
         """
         locked = MpesaService._lock_mpesa_transaction(mpesa_transaction_id)
 
@@ -813,14 +1543,67 @@ class MpesaService:
             parsed_callback["transaction_date"], 20
         )
         locked.status = MpesaTransactionStatus.RECONCILIATION_PENDING
-        MpesaService._record_reconciliation_attempt(locked)
+        if record_attempt:
+            MpesaService._record_reconciliation_attempt(locked)
+        else:
+            # Still stamp the last attempt time for observability without bumping
+            # the attempt counter.
+            locked.last_reconciled_at = datetime.utcnow()
         db.session.commit()
         current_app.logger.error(
             "M-Pesa reconciliation unreachable; keeping deposit recoverable: "
-            "mpesa_transaction=%s",
+            "mpesa_transaction=%s record_attempt=%s",
             locked.id,
+            record_attempt,
         )
         return locked
+
+    @staticmethod
+    def _callback_query(checkout_request_id):
+        """Query Daraja for a callback, deduplicated per checkout_request_id.
+
+        Returns ``(result, performed, throttled)``:
+        * ``performed`` is ``False`` when another in-flight callback already owns
+          the query for this checkout id (the caller should re-read state and
+          skip, not credit);
+        * ``throttled`` is ``True`` when the global limiter / upstream cooldown
+          blocked the request (the caller must keep the deposit recoverable
+          without charging a per-transaction attempt);
+        * ``result`` is ``None`` when no authoritative query result is available
+          (network/timeout/throttled).
+        """
+        with _CALLBACK_DEDUP_GUARD:
+            event = _callback_inflight.get(checkout_request_id)
+            if event is not None and not event.is_set():
+                owned = False
+            else:
+                event = threading.Event()
+                _callback_inflight[checkout_request_id] = event
+                owned = True
+
+        if not owned:
+            # Another callback is mid-query for this checkout id: wait for it
+            # (bounded) then signal the caller to reuse the resolved state.
+            try:
+                timeout = float(current_app.config.get("DARAJA_TIMEOUT", 30)) + 10
+            except (TypeError, ValueError):
+                timeout = 40.0
+            event.wait(timeout=timeout)
+            return None, False, False
+
+        try:
+            try:
+                result = MpesaService.query_stk_status(checkout_request_id)
+                return result, True, False
+            except (DarajaThrottled, DarajaUpstreamCooldown):
+                return None, True, True
+            except ApiError:
+                return None, True, False
+        finally:
+            with _CALLBACK_DEDUP_GUARD:
+                event.set()
+                if _callback_inflight.get(checkout_request_id) is event:
+                    _callback_inflight.pop(checkout_request_id, None)
 
     @staticmethod
     def _credit_confirmed_deposit(mpesa_transaction, callback_amount, receipt_number):
@@ -1029,6 +1812,8 @@ class MpesaService:
         A deposit that a concurrent callback completed while this query was in
         flight is therefore skipped rather than credited a second time.
         """
+        config = current_app.config
+
         if not checkout_request_id:
             # Nothing to reconcile against Daraja; leave it recoverable.
             current_app.logger.warning(
@@ -1045,11 +1830,136 @@ class MpesaService:
             mpesa_transaction_id,
             checkout_request_id,
         )
-        try:
-            query_result = MpesaService.query_stk_status(checkout_request_id)
-        except ApiError:
-            query_result = None
 
+        # --- per-transaction reconciliation metadata read (timezone-safe) ---
+        try:
+            meta = (
+                MpesaTransaction.query.with_entities(
+                    MpesaTransaction.reconciliation_attempts,
+                    MpesaTransaction.last_reconciled_at,
+                )
+                .filter_by(id=mpesa_transaction_id)
+                .first()
+            )
+        except Exception:
+            meta = None
+        # Close the read transaction; nothing must be held during the HTTP call.
+        db.session.rollback()
+
+        attempts = (meta[0] if meta is not None and meta[0] is not None else 0)
+        last = meta[1] if meta is not None else None
+
+        # --- max attempts -> manual review (terminal hold, no auto reconcile) -
+        max_attempts = config.get("MPESA_MAX_RECONCILIATION_ATTEMPTS")
+        if max_attempts is not None and attempts >= int(max_attempts):
+            return MpesaService._transition_to_manual_review(mpesa_transaction_id)
+
+        # --- per-transaction backoff (genuine outcomes only, not 403/429) -----
+        # ``last_reconciled_at`` is stored as naive UTC, so elapsed time uses
+        # naive UTC arithmetic and is identical under UTC, Africa/Nairobi and any
+        # other host timezone. 403/429 are handled by the global upstream
+        # cooldown, never charged here.
+        if last is not None:
+            elapsed = (datetime.utcnow() - last).total_seconds()
+            backoff = _mpesa_backoff_seconds(attempts, config)
+            if elapsed < backoff:
+                current_app.logger.info(
+                    "MPESA_EVENT=RECONCILIATION_SKIPPED mpesa_transaction=%s "
+                    "reason=backoff next_allowed_in=%s attempts=%s",
+                    mpesa_transaction_id,
+                    int(backoff - elapsed),
+                    attempts,
+                )
+                return "reconciliation_pending"
+
+        # --- namespaced per-transaction advisory lock + Daraja query ---------
+        # Two-argument advisory lock so it can never collide with the sweeper
+        # leader lock (which uses the single-argument form). The lock is held on
+        # a dedicated AUTOCOMMIT connection and released in a single ``finally``
+        # below, and is kept held until the reconciliation state update commits.
+        tx_conn = None
+        advisory_acquired = False
+        try:
+            if db.engine.dialect.name == "postgresql":
+                tx_conn = db.engine.connect().execution_options(
+                    isolation_level="AUTOCOMMIT"
+                )
+                advisory_acquired = tx_conn.execute(
+                    text(
+                        "SELECT pg_try_advisory_lock("
+                        "CAST(:k1 AS integer), CAST(:k2 AS integer))"
+                    ),
+                    {"k1": TX_ADVISORY_NAMESPACE, "k2": mpesa_transaction_id},
+                ).scalar()
+                if not advisory_acquired:
+                    current_app.logger.info(
+                        "MPESA_EVENT=RECONCILIATION_SKIPPED mpesa_transaction=%s "
+                        "reason=lock_held_by_other_process",
+                        mpesa_transaction_id,
+                    )
+                    return "skipped"
+
+            # Daraja query — funnelled through the shared global rate limiter and
+            # upstream cooldown inside _request_json. No DB transaction is open.
+            try:
+                query_result = MpesaService.query_stk_status(checkout_request_id)
+            except (DarajaThrottled, DarajaUpstreamCooldown):
+                # Global upstream incident: do NOT credit, do NOT charge an
+                # attempt, do NOT change the financial state. Keep recoverable.
+                current_app.logger.error(
+                    "MPESA_EVENT=RECONCILIATION_THROTTLED mpesa_transaction=%s "
+                    "checkout_request_id=%s",
+                    mpesa_transaction_id,
+                    checkout_request_id,
+                )
+                return "throttled"
+            except ApiError:
+                # Network/timeout/etc.: keep recoverable (charges an attempt).
+                query_result = None
+
+            # Apply the outcome under a row lock. The advisory lock (tx_conn)
+            # remains held until this state update commits (released in finally).
+            return MpesaService._apply_reconciliation(
+                mpesa_transaction_id, checkout_request_id, query_result
+            )
+        finally:
+            if tx_conn is not None:
+                try:
+                    if advisory_acquired:
+                        tx_conn.execute(
+                            text(
+                                "SELECT pg_advisory_unlock("
+                                "CAST(:k1 AS integer), CAST(:k2 AS integer))"
+                            ),
+                            {"k1": TX_ADVISORY_NAMESPACE, "k2": mpesa_transaction_id},
+                        )
+                except Exception:
+                    current_app.logger.exception(
+                        "MPESA_EVENT=RECONCILIATION_UNLOCK_ERROR "
+                        "mpesa_transaction=%s",
+                        mpesa_transaction_id,
+                    )
+                finally:
+                    try:
+                        tx_conn.close()
+                    except Exception:
+                        pass
+
+    @staticmethod
+    def _apply_reconciliation(mpesa_transaction_id, checkout_request_id, query_result):
+        """Apply a Daraja reconciliation outcome under a row lock.
+
+        Called with the per-transaction advisory lock already held (and released
+        by the caller). Returns the summary key for the outcome. This is the
+        single place that turns a Daraja result into a state change/credit, so
+        the financial-safety rules are enforced in exactly one spot:
+
+        * ResultCode 0  -> credit (only automatic credit path);
+        * 1032 (and other definitive failures) -> FAILED (no credit);
+        * network/timeout (query_result is None) -> keep recoverable, charge an
+          attempt (but this is NOT a 403/429 upstream incident);
+        * anything else -> keep recoverable (never FAILED, never credited).
+        """
         mpesa_transaction = MpesaService._lock_mpesa_transaction(
             mpesa_transaction_id
         )
@@ -1061,7 +1971,7 @@ class MpesaService:
                 "reason=disappeared",
                 mpesa_transaction_id,
             )
-            return "errors"
+            return "skipped"
 
         # Re-check under the lock: a callback may have resolved this deposit
         # while the Daraja query was in flight.
@@ -1076,7 +1986,10 @@ class MpesaService:
             return "skipped"
 
         if query_result is None:
-            # Daraja unreachable: keep it recoverable, never failed.
+            # Daraja unreachable (network/timeout): keep it recoverable, never
+            # failed, and charge an attempt so the per-transaction backoff can
+            # space out genuine retries. (403/429 upstream incidents never reach
+            # here — they return "throttled" earlier and charge no attempt.)
             mpesa_transaction.status = MpesaTransactionStatus.RECONCILIATION_PENDING
             MpesaService._record_reconciliation_attempt(mpesa_transaction)
             db.session.commit()
@@ -1156,6 +2069,52 @@ class MpesaService:
         return "reconciliation_pending"
 
     @staticmethod
+    def _transition_to_manual_review(mpesa_transaction_id):
+        """Move a deposit into the terminal ``ManualReviewRequired`` hold.
+
+        Used when automatic reconciliation has exhausted its budget
+        (``MPESA_MAX_RECONCILIATION_ATTEMPTS``) without a definitive Daraja
+        outcome. The deposit is then excluded from every automatic recovery path
+        (sweeper/user/admin/callback), remains uncredited, and is never
+        automatically marked FAILED — a human must resolve it. The existing
+        idempotent credit path remains available for a future human-confirmed
+        payment, so this is a hold, not a loss.
+        """
+        config = current_app.config
+        max_attempts = config.get("MPESA_MAX_RECONCILIATION_ATTEMPTS")
+        locked = MpesaService._lock_mpesa_transaction(mpesa_transaction_id)
+
+        if locked is None:
+            db.session.rollback()
+            return "skipped"
+
+        if MpesaTransactionStatus.is_terminal(locked.status):
+            db.session.rollback()
+            return "skipped"
+
+        if (
+            max_attempts is not None
+            and (locked.reconciliation_attempts or 0) < int(max_attempts)
+        ):
+            # A concurrent path already advanced it below the threshold; let the
+            # normal reconciliation path handle it instead of forcing a hold.
+            db.session.rollback()
+            return "reconciliation_pending"
+
+        locked.status = MpesaTransactionStatus.MANUAL_REVIEW_REQUIRED
+        locked.failure_reason = truncate(
+            "Exhausted automatic reconciliation attempts; requires manual review.",
+            RESULT_DESC_MAX_LENGTH,
+        )
+        db.session.commit()
+        current_app.logger.error(
+            "MPESA_EVENT=MANUAL_REVIEW_REQUIRED mpesa_transaction=%s attempts=%s",
+            locked.id,
+            locked.reconciliation_attempts or 0,
+        )
+        return "manual_review"
+
+    @staticmethod
     def recover_deposits():
         """Recover PENDING and RECONCILIATION_PENDING deposits via Daraja.
 
@@ -1180,6 +2139,8 @@ class MpesaService:
             "credited": 0,
             "failed": 0,
             "reconciliation_pending": 0,
+            "throttled": 0,
+            "manual_review": 0,
             "skipped": 0,
             "errors": 0,
         }

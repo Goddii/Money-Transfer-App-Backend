@@ -82,6 +82,52 @@ class Config:
         'MPESA_MAX_RECONCILIATION_ATTEMPTS', 48
     )
 
+    # --- Daraja global rate limiting & upstream cooldown (Cross-process) -----
+    # All outbound Daraja traffic (OAuth, STK Push, STK Query, reconciliation)
+    # is funnelled through one shared limiter so a single Render instance or
+    # Gunicorn worker cannot exhaust Daraja's application-wide quota on its own.
+    # On PostgreSQL the limiter is a database-backed token bucket shared by every
+    # process/instance; on other backends an in-process token bucket is used
+    # (safe only for a single process).
+    #
+    # Conservative defaults: ~<=25 requests/minute and a small burst capacity so
+    # multiple concurrent callers cannot spike Daraja.
+    DARAJA_RATE_LIMIT_CAPACITY = float(
+        os.environ.get('DARAJA_RATE_LIMIT_CAPACITY', '5')
+    )
+    DARAJA_RATE_LIMIT_REFILL_PER_SEC = float(
+        os.environ.get(
+            'DARAJA_RATE_LIMIT_REFILL_PER_SEC',
+            '0.4167',  # 25 per 60 seconds
+        )
+    )
+
+    # Upstream cooldown durations (seconds) applied after a definitive global
+    # upstream signal. These prevent one 403/429/5xx from inflating every
+    # pending transaction's attempt counter. Honour Retry-After for 429 when
+    # present (capped at DARAJA_COOLDOWN_429_MAX_SECONDS).
+    DARAJA_COOLDOWN_429_SECONDS = _parse_int_env('DARAJA_COOLDOWN_429_SECONDS', 30)
+    DARAJA_COOLDOWN_429_MAX_SECONDS = _parse_int_env(
+        'DARAJA_COOLDOWN_429_MAX_SECONDS', 120
+    )
+    DARAJA_COOLDOWN_403_SECONDS = _parse_int_env(
+        'DARAJA_COOLDOWN_403_SECONDS', 300
+    )
+    DARAJA_COOLDOWN_5XX_SECONDS = _parse_int_env('DARAJA_COOLDOWN_5XX_SECONDS', 30)
+
+    # --- Per-transaction reconciliation backoff (config-driven) --------------
+    # Genuine reconciliation outcomes (inconclusive/network) are retried with
+    # exponential backoff. This is NOT charged against Daraja's upstream quota
+    # and must never be applied to 403/429 (those are handled by the global
+    # upstream cooldown). Defaults are deliberately short: a genuine pending
+    # payment must not wait 24 hours because of a few upstream failures.
+    MPESA_BACKOFF_BASE_SECONDS = _parse_int_env(
+        'MPESA_BACKOFF_BASE_SECONDS', 30
+    )
+    MPESA_BACKOFF_MAX_SECONDS = _parse_int_env(
+        'MPESA_BACKOFF_MAX_SECONDS', 1800
+    )
+
     # Optional defence-in-depth: only accept M-Pesa callbacks from these source
     # IPs (comma-separated). Empty/unset means "allow all" — the authoritative
     # protection is Daraja reconciliation (see mpesa_service.query_stk_status),
@@ -118,3 +164,16 @@ class TestConfig(Config):
     DARAJA_PASSKEY = 'test-passkey'
     DARAJA_CALLBACK_URL = 'https://example.test/api/mpesa/callback'
     DARAJA_BASE_URL = 'https://sandbox.safaricom.co.ke'
+
+    # Tests never talk to real Daraja and run many outbound "requests" in quick
+    # succession. Give the global limiter a practically unlimited budget so it
+    # does not throttle ordinary tests; the limiter itself is exercised by
+    # dedicated, focused tests that install a tight budget.
+    DARAJA_RATE_LIMIT_CAPACITY = 1_000_000.0
+    DARAJA_RATE_LIMIT_REFILL_PER_SEC = 1_000_000.0
+    DARAJA_COOLDOWN_429_SECONDS = 1
+    DARAJA_COOLDOWN_429_MAX_SECONDS = 5
+    DARAJA_COOLDOWN_403_SECONDS = 5
+    DARAJA_COOLDOWN_5XX_SECONDS = 1
+    MPESA_BACKOFF_BASE_SECONDS = 1
+    MPESA_BACKOFF_MAX_SECONDS = 10
