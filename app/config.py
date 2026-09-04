@@ -82,6 +82,31 @@ class Config:
         'MPESA_MAX_RECONCILIATION_ATTEMPTS', 48
     )
 
+    # Hard age cutoff for automatic reconciliation. A deposit that has been
+    # recoverable (PENDING / RECONCILIATION_PENDING) for longer than this many
+    # seconds is moved to the terminal MANUAL_REVIEW_REQUIRED hold and stops
+    # being re-queried, even if it has not yet hit the attempt budget. This
+    # bounds "retries forever" for a deposit stuck for days (see the ~47h,
+    # 12-attempt STUCK_DEPOSIT_ALERT case). Default 48h. Set to 0 / unset to
+    # disable and rely on the attempt budget alone.
+    MPESA_MAX_RECONCILIATION_AGE_SECONDS = _parse_int_env(
+        'MPESA_MAX_RECONCILIATION_AGE_SECONDS', 172800
+    )
+
+    # Daraja STK Push *Query* errorCodes that describe ONE checkout request (the
+    # "500.001.xxxx" processing-error family) rather than the health of the
+    # Daraja API. Safaricom returns these as HTTP 500 with a JSON body of the
+    # form {"errorCode": "500.001.1001", "errorMessage": "The transaction does
+    # not exist"}. They must be handled per-transaction and must never trip the
+    # shared global upstream cooldown. Comma-separated; the "500.001." prefix is
+    # always treated as this family regardless of this list.
+    _query_tx_error_codes = os.environ.get('DARAJA_QUERY_TRANSACTION_ERROR_CODES')
+    DARAJA_QUERY_TRANSACTION_ERROR_CODES = (
+        [c.strip() for c in _query_tx_error_codes.split(',') if c.strip()]
+        if _query_tx_error_codes
+        else ['500.001.1001']
+    )
+
     # --- Daraja global rate limiting & upstream cooldown (Cross-process) -----
     # All outbound Daraja traffic (OAuth, STK Push, STK Query, reconciliation)
     # is funnelled through one shared limiter so a single Render instance or
