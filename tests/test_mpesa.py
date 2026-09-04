@@ -3075,7 +3075,7 @@ def test_callback_respects_global_limiter(client, app, authenticated_user, fake_
     monkeypatch.setattr(
         MpesaService,
         "_daraja_acquire_permit",
-        staticmethod(lambda config, what: (False, 30)),
+        staticmethod(lambda config, what, **kwargs: (False, 30)),
     )
 
     response = client.post(CALLBACK_URL, json=_callback_payload())
@@ -3127,6 +3127,147 @@ def test_callback_duplicate_query_prevented(client, app, authenticated_user, fak
     ]
     assert len(query_posts) == 1
     assert _balance(app, user["id"]) == Decimal("510.00")
+
+
+def _pending_deposit(app, user, checkout_request_id, **overrides):
+    with app.app_context():
+        wallet = Wallet.query.filter_by(user_id=user["id"]).first()
+        fields = dict(
+            user_id=user["id"],
+            wallet_id=wallet.id,
+            account_reference="REF" + checkout_request_id[-6:],
+            phone_number="254712345678",
+            amount=Decimal("500.00"),
+            status=MpesaTransactionStatus.RECONCILIATION_PENDING,
+            checkout_request_id=checkout_request_id,
+        )
+        fields.update(overrides)
+        m = MpesaTransaction(**fields)
+        db.session.add(m)
+        db.session.commit()
+
+
+def test_stk_query_transaction_not_found_is_terminal_and_never_cools_down(
+    app, create_user, fake_daraja
+):
+    """errorCode 500.001.1001 ("does not exist") -> manual review, no cooldown.
+
+    Safaricom returns this HTTP 500 body when the CheckoutRequestID is unknown /
+    expired. It is terminal for that one deposit and must NOT trip the global
+    upstream cooldown that would block every other in-flight transaction.
+    """
+    fake_daraja(
+        query_status=500,
+        query_response={
+            "requestId": "ws_CO_notfound",
+            "errorCode": "500.001.1001",
+            "errorMessage": "The transaction does not Exist",
+        },
+    )
+    user = create_user(email="notfound@example.com", balance="10.00")
+    _pending_deposit(app, user, "ws_CO_notfound", reconciliation_attempts=3)
+
+    with app.app_context():
+        summary = MpesaService.recover_deposits()
+        assert summary["manual_review"] == 1
+        assert summary["throttled"] == 0
+        # The global upstream cooldown was never armed.
+        assert MpesaService._daraja_cooldown_remaining(app.config) == 0.0
+
+        stored = MpesaTransaction.query.filter_by(
+            checkout_request_id="ws_CO_notfound"
+        ).first()
+        assert stored.status == MpesaTransactionStatus.MANUAL_REVIEW_REQUIRED
+        assert "500.001.1001" in stored.failure_reason
+        assert Transaction.query.count() == 0
+        assert WalletLedger.query.count() == 0
+
+
+def test_stk_query_transaction_still_processing_stays_recoverable_no_cooldown(
+    app, create_user, fake_daraja
+):
+    """errorCode 500.001.1001 ("being processed") -> recoverable, no cooldown."""
+    fake_daraja(
+        query_status=500,
+        query_response={
+            "requestId": "ws_CO_proc",
+            "errorCode": "500.001.1001",
+            "errorMessage": "The transaction is being processed",
+        },
+    )
+    user = create_user(email="processing@example.com", balance="10.00")
+    _pending_deposit(app, user, "ws_CO_proc", reconciliation_attempts=1)
+
+    with app.app_context():
+        summary = MpesaService.recover_deposits()
+        assert summary["reconciliation_pending"] == 1
+        assert summary["throttled"] == 0
+        assert MpesaService._daraja_cooldown_remaining(app.config) == 0.0
+
+        stored = MpesaTransaction.query.filter_by(
+            checkout_request_id="ws_CO_proc"
+        ).first()
+        assert stored.status == MpesaTransactionStatus.RECONCILIATION_PENDING
+        # A genuine (non-upstream) inconclusive outcome charges one attempt.
+        assert stored.reconciliation_attempts == 2
+
+
+def test_reconciliation_5xx_cooldown_does_not_block_new_stk_push(
+    client, app, authenticated_user, fake_daraja
+):
+    """A genuine 5xx from the poller must not 502 an unrelated user's STK Push."""
+    user, headers = authenticated_user(email="domains@example.com", balance="10.00")
+    _pending_deposit(app, user, "ws_CO_5xx")
+
+    # A real Safaricom 5xx (opaque body) while polling -> reconciliation-scoped
+    # cooldown.
+    fake_daraja(query_status=500, query_non_json=True)
+    with app.app_context():
+        summary = MpesaService.recover_deposits()
+        assert summary["throttled"] == 1
+        # The cooldown is armed for the reconciliation domain...
+        assert MpesaService._daraja_cooldown_remaining(app.config) > 0
+        # ...but invisible to a brand-new initiation.
+        assert (
+            MpesaService._daraja_cooldown_remaining(
+                app.config, domain="initiation"
+            )
+            == 0.0
+        )
+
+    # A different user's STK Push still succeeds.
+    other, other_headers = authenticated_user(
+        email="fresh@example.com", balance="10.00"
+    )
+    deposit = _initiate_deposit(client, other_headers, fake_daraja)
+    assert deposit["status"] == MpesaTransactionStatus.PENDING
+
+
+def test_reconciliation_max_age_transitions_to_manual_review(
+    app, create_user, fake_daraja
+):
+    """A deposit older than MPESA_MAX_RECONCILIATION_AGE_SECONDS -> manual review."""
+    fake_daraja(query_response={"ResultCode": "0", "ResultDesc": "Success."})
+    user = create_user(email="old@example.com", balance="10.00")
+    _pending_deposit(
+        app,
+        user,
+        "ws_CO_old",
+        reconciliation_attempts=12,
+        created_at=datetime.utcnow() - timedelta(hours=50),
+    )
+
+    with app.app_context():
+        # Default 48h cutoff; attempts (12) are well below the attempt budget.
+        summary = MpesaService.recover_deposits()
+        assert summary["manual_review"] == 1
+
+        stored = MpesaTransaction.query.filter_by(
+            checkout_request_id="ws_CO_old"
+        ).first()
+        assert stored.status == MpesaTransactionStatus.MANUAL_REVIEW_REQUIRED
+        assert "unresolved" in stored.failure_reason
+        assert Transaction.query.count() == 0
 
 
 def test_max_attempts_transitions_to_manual_review(app, create_user, fake_daraja):
